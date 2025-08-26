@@ -1,64 +1,132 @@
-
 'use client'
 import { useEffect, useState } from 'react'
+
+type Jobs = { portrait?: string; landscape?: string }
 
 export default function Home() {
   const [topic, setTopic] = useState('')
   const [niche, setNiche] = useState('General')
-  const [dur, setDur] = useState<number>(15)
-  const [jobId, setJobId] = useState<string | null>(null)
-  const [status, setStatus] = useState<string>('')
-  const [videoUrl, setVideoUrl] = useState<string | null>(null)
+  const [tone, setTone] = useState('Informative')
+  const [dur, setDur] = useState<number>(30)
+
+  const [usePortrait, setUsePortrait] = useState(true)   // 9:16 (TikTok)
+  const [useLandscape, setUseLandscape] = useState(true) // 16:9 (YouTube)
+
+  const [jobs, setJobs] = useState<Jobs>({})
+  const [statusP, setStatusP] = useState('')  // portrait status
+  const [statusL, setStatusL] = useState('')  // landscape status
+  const [urlP, setUrlP] = useState<string | null>(null)
+  const [urlL, setUrlL] = useState<string | null>(null)
 
   async function startJob(e: React.FormEvent) {
     e.preventDefault()
-    setVideoUrl(null)
-    setStatus('starting…')
+    if (!usePortrait && !useLandscape) {
+      alert('Select at least one output (TikTok and/or YouTube).')
+      return
+    }
+    setUrlP(null); setUrlL(null); setStatusP(''); setStatusL('')
 
     const res = await fetch('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic, niche, targetDurationSec: Number(dur) })
+      body: JSON.stringify({
+        topic,
+        niche,
+        tone,
+        targetDurationSec: Number(dur),
+        outputs: { portrait: usePortrait, landscape: useLandscape }
+      })
     })
-    if (!res.ok) { setStatus('failed'); alert('Failed to start'); return }
-    const { jobId } = await res.json()
-    setJobId(jobId)
-    setStatus('queued')
+
+    if (!res.ok) {
+      const msg = await res.text().catch(() => '')
+      alert(`Failed to start job. ${msg}`)
+      return
+    }
+
+    const data = await res.json()
+    setJobs(data.jobs || {})
   }
 
+  // watch portrait job
   useEffect(() => {
-    if (!jobId) return
-    const iv = setInterval(async () => {
-      const r = await fetch(`/api/jobs/${jobId}`)
+    if (!jobs.portrait) return
+    setStatusP('queued')
+    const id = jobs.portrait
+    const t = setInterval(async () => {
+      const r = await fetch(`/api/jobs/${id}`)
       if (!r.ok) return
       const d = await r.json()
-      setStatus(d.status)
-      if (d.status === 'done') { setVideoUrl(d.url); clearInterval(iv) }
-      if (d.status === 'failed') { clearInterval(iv); alert(d.message || 'Render failed') }
+      setStatusP(d.status)
+      if (d.status === 'done') { setUrlP(d.url); clearInterval(t) }
+      if (d.status === 'failed') { clearInterval(t) }
     }, 1500)
-    return () => clearInterval(iv)
-  }, [jobId])
+    return () => clearInterval(t)
+  }, [jobs.portrait])
+
+  // watch landscape job
+  useEffect(() => {
+    if (!jobs.landscape) return
+    setStatusL('queued')
+    const id = jobs.landscape
+    const t = setInterval(async () => {
+      const r = await fetch(`/api/jobs/${id}`)
+      if (!r.ok) return
+      const d = await r.json()
+      setStatusL(d.status)
+      if (d.status === 'done') { setUrlL(d.url); clearInterval(t) }
+      if (d.status === 'failed') { clearInterval(t) }
+    }, 1500)
+    return () => clearInterval(t)
+  }, [jobs.landscape])
 
   return (
-    <main style={{ maxWidth: 640, margin: '2rem auto', fontFamily: 'ui-sans-serif' }}>
-      <h1>Faceless Auto-Editor (v0 – Vercel-only)</h1>
+    <main style={{ maxWidth: 720, margin: '2rem auto', fontFamily: 'ui-sans-serif' }}>
+      <h1>Faceless Auto-Editor (v0.2)</h1>
 
       <form onSubmit={startJob} style={{ display: 'grid', gap: 12 }}>
         <label>Topic <input value={topic} onChange={e => setTopic(e.target.value)} required /></label>
         <label>Niche <input value={niche} onChange={e => setNiche(e.target.value)} required /></label>
-        <label>Target Duration (sec) <input type="number" value={dur} min={10} onChange={e => setDur(Number(e.target.value))} /></label>
+        <label>Tone <input value={tone} onChange={e => setTone(e.target.value)} placeholder="Informative, playful, dramatic…" /></label>
+        <label>Target Duration (sec) <input type="number" min={10} value={dur} onChange={e => setDur(Number(e.target.value))} /></label>
+
+        <label><input type="checkbox" checked={usePortrait} onChange={e => setUsePortrait(e.target.checked)} /> Generate TikTok (9:16)</label>
+        <label><input type="checkbox" checked={useLandscape} onChange={e => setUseLandscape(e.target.checked)} /> Generate YouTube (16:9)</label>
+
         <button type="submit">Build</button>
       </form>
 
-      {jobId && <div style={{ marginTop: 20 }}>
-        <div><b>Job:</b> {jobId}</div>
-        <div><b>Status:</b> {status}</div>
-      </div>}
+      {(jobs.portrait || jobs.landscape) && (
+        <div style={{ marginTop: 20, display: 'grid', gap: 16 }}>
+          {jobs.portrait && (
+            <div>
+              <div><b>9:16 status:</b> {statusP}</div>
+              {urlP && (
+                <>
+                  <div style={{ marginTop: 8 }}>
+                    <video src={urlP} controls style={{ width: '100%', borderRadius: 12 }} />
+                  </div>
+                  <a href={urlP} target="_blank" rel="noreferrer">Open 9:16</a>
+                </>
+              )}
+            </div>
+          )}
 
-      {videoUrl && <div style={{ marginTop: 20 }}>
-        <video src={videoUrl} controls style={{ width: '100%', borderRadius: 12 }} />
-        <div style={{ marginTop: 8 }}><a href={videoUrl} target="_blank">Open in new tab</a></div>
-      </div>}
+          {jobs.landscape && (
+            <div>
+              <div><b>16:9 status:</b> {statusL}</div>
+              {urlL && (
+                <>
+                  <div style={{ marginTop: 8 }}>
+                    <video src={urlL} controls style={{ width: '100%', borderRadius: 12 }} />
+                  </div>
+                  <a href={urlL} target="_blank" rel="noreferrer">Open 16:9</a>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </main>
   )
 }

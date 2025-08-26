@@ -8,41 +8,40 @@ const j = (o:any, s=200) => NextResponse.json(o, { status: s })
 type Segment = { start:number; end:number; text:string }
 type Word = { start:number; end:number; word:string }
 
-const MIN_BEAT_SEC = Number(process.env.MIN_BEAT_SEC || 2.5)
-const MAX_BEAT_SEC = Number(process.env.MAX_BEAT_SEC || 6.5)
-const PAUSE_BREAK_SEC = Number(process.env.PAUSE_BREAK_SEC || 0.6)
+const SMART_BEATS = process.env.SMART_BEATS === '1'            // <— TOGGLE
+
+const MIN_BEAT_SEC     = Number(process.env.MIN_BEAT_SEC      || 2.5)
+const MAX_BEAT_SEC     = Number(process.env.MAX_BEAT_SEC      || 6.5)
+const PAUSE_BREAK_SEC  = Number(process.env.PAUSE_BREAK_SEC    || 0.6)
 
 function clip(n:number, lo:number, hi:number){ return Math.max(lo, Math.min(hi, n)) }
 
-function buildChunksFromWords(words:Word[], transcript:string){
+function buildChunksFromWords(words:Word[]){
   if (!words?.length) return []
   const chunks:{startIdx:number; endIdx:number; start:number; end:number; text:string}[] = []
   let curStartIdx = 0
   for (let i=1;i<words.length;i++){
     const gap = words[i].start - words[i-1].end
-    const prev = words[i-1].word
-    const isPunct = /[.?!:,;]$/.test(prev)
+    const isPunct = /[.?!:,;]$/.test(words[i-1].word)
     if (gap >= PAUSE_BREAK_SEC || isPunct){
       const start = words[curStartIdx].start
-      const end = words[i-1].end
-      const text = words.slice(curStartIdx, i).map(w=>w.word).join(' ')
+      const end   = words[i-1].end
+      const text  = words.slice(curStartIdx, i).map(w=>w.word).join(' ')
       if (text.trim()) chunks.push({ startIdx: curStartIdx, endIdx: i-1, start, end, text })
       curStartIdx = i
     }
   }
   // tail
   const start = words[curStartIdx].start
-  const end = words[words.length-1].end
-  const text = words.slice(curStartIdx).map(w=>w.word).join(' ')
+  const end   = words[words.length-1].end
+  const text  = words.slice(curStartIdx).map(w=>w.word).join(' ')
   if (text.trim()) chunks.push({ startIdx: curStartIdx, endIdx: words.length-1, start, end, text })
   return chunks
 }
 
 function nearestWordTime(t:number, words:Word[]){
-  // snap t to nearest word boundary (start or end)
   if (!words.length) return t
-  let best = words[0].start
-  let bestD = Math.abs(t - best)
+  let best = words[0].start, bestD = Math.abs(t-best)
   for (const w of words){
     const c1 = w.start, c2 = w.end
     const d1 = Math.abs(t - c1), d2 = Math.abs(t - c2)
@@ -50,6 +49,71 @@ function nearestWordTime(t:number, words:Word[]){
     if (d2 < bestD){ best = c2; bestD = d2 }
   }
   return best
+}
+
+// ---- Non-LLM, deterministic grouping (used when SMART_BEATS != 1) ----
+function simpleBeatsFromChunks(chunks:ReturnType<typeof buildChunksFromWords>, words:Word[], audioLen:number, targetDurationSec?:number){
+  if (!chunks.length) return [{ start: 0, end: audioLen, text: words.map(w=>w.word).join(' ') }]
+  const idealBeat = clip(Number(targetDurationSec || audioLen) / 5, MIN_BEAT_SEC, MAX_BEAT_SEC)
+  const desired   = clip(Math.round(audioLen / idealBeat), 3, 8)
+
+  const beats:{start:number; end:number; text:string}[] = []
+  let curStart = chunks[0].start
+  let accText:string[] = []
+  let accEnd = chunks[0].end
+  let accDur = 0
+  let i = 0
+
+  while (i < chunks.length){
+    const c = chunks[i]
+    const addDur = c.end - (beats.length ? accEnd : curStart)
+    const nextDur = accDur + addDur
+
+    // decide to close the beat
+    const shouldCloseBecauseMax = nextDur >= MAX_BEAT_SEC
+    const longEnough            = nextDur >= MIN_BEAT_SEC
+    const remainingChunks       = chunks.length - (i+1)
+    const remainingBeatsTarget  = Math.max(1, desired - beats.length - 1)
+    const mustCloseToReachTarget= remainingChunks <= remainingBeatsTarget // avoid too few beats at the end
+
+    accText.push(c.text)
+    accEnd = c.end
+    accDur = nextDur
+    i++
+
+    if (shouldCloseBecauseMax || (longEnough && !mustCloseToReachTarget)) {
+      const s = nearestWordTime(curStart, words)
+      const e = nearestWordTime(accEnd, words)
+      beats.push({ start: s, end: e, text: accText.join(' ').replace(/\s+/g,' ').trim() })
+      // reset
+      if (i < chunks.length){
+        curStart = chunks[i].start
+        accText = []
+        accEnd = chunks[i].end
+        accDur = 0
+      }
+    }
+  }
+
+  // tail if needed
+  if (accText.length){
+    const s = nearestWordTime(curStart, words)
+    const e = nearestWordTime(Math.max(accEnd, s + MIN_BEAT_SEC), words)
+    beats.push({ start: s, end: e, text: accText.join(' ').replace(/\s+/g,' ').trim() })
+  }
+
+  // clamp and ensure monotonic
+  const fixed = beats.map(b => ({
+    start: clip(b.start, 0, audioLen),
+    end:   clip(b.end,   b.start + MIN_BEAT_SEC, audioLen),
+    text:  b.text
+  }))
+  for (let k=1;k<fixed.length;k++){
+    fixed[k].start = Math.max(fixed[k].start, fixed[k-1].end)
+    fixed[k].end   = Math.max(fixed[k].end,   fixed[k].start + MIN_BEAT_SEC)
+  }
+  if (fixed.length) fixed[fixed.length-1].end = Math.max(fixed[fixed.length-1].end, Math.min(audioLen, fixed[fixed.length-1].start + MIN_BEAT_SEC))
+  return fixed
 }
 
 export async function POST(req: NextRequest){
@@ -63,17 +127,18 @@ export async function POST(req: NextRequest){
     if (!words?.length) return j({ error:'missing_words' }, 400)
 
     const audioLen = words[words.length-1].end
-    const chunks = buildChunksFromWords(words, transcript)
-    if (!chunks.length) {
-      // fallback: 1 beat covering full audio
-      return j({ beats: [{ start: 0, end: audioLen, text: transcript.trim() }] })
+    const chunks = buildChunksFromWords(words)
+
+    // If LLM beats are OFF, return deterministic beats
+    if (!SMART_BEATS) {
+      const beats = simpleBeatsFromChunks(chunks, words, audioLen, targetDurationSec)
+      return j({ beats })
     }
 
-    // target beat count based on audio length
+    // ----- LLM beat grouping (SMART_BEATS=1) -----
     const idealBeat = clip(Number(targetDurationSec || audioLen) / 5, MIN_BEAT_SEC, MAX_BEAT_SEC)
     const desiredBeats = clip(Math.round(audioLen / idealBeat), 3, 8)
 
-    // Prepare compact chunk list for the LLM
     const chunkLines = chunks.map((c, i) => {
       const dur = (c.end - c.start).toFixed(2)
       const text = c.text.replace(/\s+/g,' ').slice(0,120)
@@ -104,47 +169,35 @@ Return strict JSON:
     })
     if (!resp.ok) return j({ error:'llm_failed', details: await resp.text() }, 500)
     const out = await resp.json()
-    let beats = []
-    try {
-      const parsed = JSON.parse(out.choices[0].message.content || '{}')
-      beats = Array.isArray(parsed.beats) ? parsed.beats : []
-    } catch { beats = [] }
+    let beatsSpec:any[] = []
+    try { beatsSpec = JSON.parse(out.choices[0].message.content || '{}').beats || [] } catch {}
 
-    if (!beats.length) {
-      // simple fallback: spread evenly by duration constraints
-      const even: {start:number; end:number; text:string}[] = []
-      const segLen = clip(audioLen / desiredBeats, MIN_BEAT_SEC, MAX_BEAT_SEC)
-      for (let i=0;i<desiredBeats;i++){
-        const start = clip(i*segLen, 0, audioLen-0.1)
-        const end = clip((i+1)*segLen, start+MIN_BEAT_SEC, audioLen)
-        even.push({ start, end, text: transcript.slice(0,120) })
-      }
-      return j({ beats: even })
+    if (!beatsSpec.length) {
+      // Fallback to deterministic if LLM returns nothing
+      const beats = simpleBeatsFromChunks(chunks, words, audioLen, targetDurationSec)
+      return j({ beats })
     }
 
-    // Map chunk groups -> timed beats
-    const result: { start:number; end:number; text:string; label?:string }[] = []
-    for (const b of beats){
+    const beats:{start:number; end:number; text:string}[] = []
+    for (const b of beatsSpec){
       const si = Math.max(0, Math.min(chunks.length-1, Number(b.start_index)))
       const ei = Math.max(si, Math.min(chunks.length-1, Number(b.end_index)))
-      const start = nearestWordTime(chunks[si].start, words)
-      const end = nearestWordTime(chunks[ei].end, words)
-      const text = chunks.slice(si, ei+1).map(c=>c.text).join(' ').replace(/\s+/g,' ').trim()
-      result.push({ start, end, text, label: typeof b.label === 'string' ? b.label : undefined })
+      const s  = nearestWordTime(chunks[si].start, words)
+      const e  = nearestWordTime(chunks[ei].end,   words)
+      const t  = chunks.slice(si, ei+1).map(c=>c.text).join(' ').replace(/\s+/g,' ').trim()
+      beats.push({ start:s, end:e, text:t })
     }
 
-    // Sanity fix: monotonic, bounded, min/max duration
+    // sanitize
     const fixed: { start:number; end:number; text:string }[] = []
     let cursor = 0
-    for (const r of result){
+    for (const r of beats){
       let s = clip(Math.max(r.start, cursor), 0, audioLen)
       let e = clip(r.end, s + MIN_BEAT_SEC, audioLen)
-      const len = e - s
-      if (len > MAX_BEAT_SEC) e = s + MAX_BEAT_SEC
+      if (e - s > MAX_BEAT_SEC) e = s + MAX_BEAT_SEC
       fixed.push({ start: s, end: e, text: r.text })
       cursor = e
     }
-    // ensure last covers to end minus a small tail if needed
     if (fixed.length) fixed[fixed.length-1].end = Math.max(fixed[fixed.length-1].end, Math.min(audioLen, fixed[fixed.length-1].start + MIN_BEAT_SEC))
 
     return j({ beats: fixed })

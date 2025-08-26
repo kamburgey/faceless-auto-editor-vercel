@@ -7,28 +7,29 @@ export const maxDuration = 60
 const j = (o:any, s=200) => NextResponse.json(o, { status: s })
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
-// ✅ use your existing env var name; fallback kept for safety
 const ELEVEN_MODEL = process.env.ELEVENLABS_TTS_MODEL || 'eleven_turbo_v2_5'
 
 // ---- helpers ----
 function clamp(n:number,min:number,max:number){ return Math.max(min, Math.min(max, n)) }
 
 function mapVoiceSettings(style: string, pace: number, breaths: boolean) {
-  const p = clamp(pace || 1, 0.85, 1.15)
+  // ElevenLabs expects 0..1 for all floats (style, stability, similarity_boost)
+  // We also bias stability slightly lower if breaths=true to allow softer prosody.
+  const stabBase = breaths ? 0.44 : 0.5
   if (style === 'energetic') {
-    return { stability: 0.55, similarity_boost: 0.75, style: 75, use_speaker_boost: true }
+    return { stability: clamp(stabBase + 0.04, 0, 1), similarity_boost: 0.75, style: 0.75 }
   }
   if (style === 'narrator_warm') {
-    return { stability: 0.5, similarity_boost: 0.8, style: 55, use_speaker_boost: true }
+    return { stability: clamp(stabBase + 0.02, 0, 1), similarity_boost: 0.80, style: 0.55 }
   }
   // natural_conversational
-  return { stability: breaths ? 0.45 : 0.5, similarity_boost: 0.8, style: 35, use_speaker_boost: true }
+  return { stability: stabBase, similarity_boost: 0.80, style: 0.35 }
 }
 
 function postProcessForPace(text: string, pace: number, breaths: boolean) {
   const p = clamp(pace || 1, 0.85, 1.15)
   let t = text.trim()
-  // Encourage natural line breaks for TTS cadence
+  // encourage natural cadence for TTS
   t = t.replace(/\s*\n+\s*/g, ' ').replace(/\s+/g, ' ')
   t = t.replace(/([.!?])\s+/g, '$1\n')
   if (p < 0.98) {
@@ -66,7 +67,7 @@ export async function POST(req: NextRequest) {
 
     // --- 1) Narration (tone + niche + pacing-aware word count) ---
     const pace = clamp(tts?.pace ?? 1.0, 0.85, 1.15)
-    const wpmBase = 165 // typical neutral narration
+    const wpmBase = 165
     const targetWPM = Math.round(wpmBase * pace)
     const targetWords = clamp(Math.round((targetDurationSec / 60) * targetWPM), 60, 230)
 
@@ -104,7 +105,7 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({
         text: narration,
-        model_id: ELEVEN_MODEL,      // <- now uses ELEVENLABS_TTS_MODEL env
+        model_id: ELEVEN_MODEL,
         voice_settings
       })
     })

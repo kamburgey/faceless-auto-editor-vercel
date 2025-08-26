@@ -32,14 +32,15 @@ export async function POST(req: NextRequest) {
     let candidates: Array<{id:number|string; src:string; duration:number; frames:string[]; assetType:'video'|'image'; width?:number; height?:number}> = []
     if (vr.ok) {
       const vd = await vr.json()
-      const uniq:any[] = []; const seen=new Set()
+      const uniq:any[] = []
+      const seen=new Set()
       for (const v of vd.videos||[]) { if (seen.has(v.id)) continue; seen.add(v.id); uniq.push(v) }
       candidates = uniq.slice(0,MAX_CANDIDATES).map((v:any)=>{
         const file = pickSdFile(v)
         const frames = framesFrom(v.video_pictures||[], FRAMES_PER_CANDIDATE)
         const cover = v.image ? [v.image] : []
         return { id:v.id, src:file?.link, duration:v.duration||segLen, frames: frames.length?frames:cover, assetType:'video' as const, width:v.width, height:v.height }
-      }).filter(c=>!!c.src)
+      }).filter((c:any)=>!!c.src)
     }
 
     // photo fallback
@@ -51,7 +52,8 @@ export async function POST(req: NextRequest) {
           id:p.id, src: p.src?.original || p.src?.large2x || p.src?.large,
           duration: segLen, frames: [p.src?.medium || p.src?.large || p.src?.original].filter(Boolean),
           assetType:'image' as const, width:p.width, height:p.height
-        })).filter(c=>!!c.src)
+        }))
+        .filter((c:any)=>!!c.src)   // <-- typed param to avoid TS implicit-any error
       }
     }
 

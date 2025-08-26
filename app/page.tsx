@@ -14,8 +14,7 @@ type Clip = { src: string; start: number; length: number; assetType: 'video' | '
 type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'
 type VOStyle = 'natural_conversational' | 'narrator_warm' | 'energetic'
 
-const DEFAULT_UI_VOICE =
-  process.env.NEXT_PUBLIC_ELEVENLABS_VOICE_ID || 'wBXNqKUATyqu0RtYt25i'
+const DEFAULT_UI_VOICE = 'wBXNqKUATyqu0RtYt25i' // literal default per your note
 
 export default function Home() {
   // ---------- form ----------
@@ -24,7 +23,7 @@ export default function Home() {
   const [tone, setTone] = useState('informative, upbeat')
   const [dur, setDur] = useState<number>(25)
 
-  // voiceover controls (these are sent to /api/jobs/start -> tts)
+  // voiceover controls (sent to /api/jobs/start -> tts)
   const [voiceId, setVoiceId] = useState<string>(DEFAULT_UI_VOICE)
   const [voStyle, setVoStyle] = useState<VOStyle>('natural_conversational')
   const [voPace, setVoPace] = useState<number>(0.95) // slower = more natural cadence
@@ -87,12 +86,12 @@ export default function Home() {
           niche,
           tone,
           targetDurationSec: Number(dur),
-          // Voiceover knobs (server now honors these)
+          // Voiceover knobs (server honors these)
           tts: {
             voiceId: voiceId?.trim() || undefined,
             style: voStyle,       // 'natural_conversational' | 'narrator_warm' | 'energetic'
             pace: voPace,         // 0.85–1.15 typical
-            breaths: voBreaths    // hint to add natural pauses
+            breaths: voBreaths    // hint to insert natural micro-pauses
           }
         })
       })
@@ -259,9 +258,6 @@ export default function Home() {
           <label style={{ marginLeft: 12 }}>
             <input type="checkbox" checked={voBreaths} onChange={e => setVoBreaths(e.target.checked)} /> Natural pauses/breaths
           </label>
-          <div style={{ fontSize: 12, opacity: .7, marginTop: 6 }}>
-            These hints are honored by the TTS step in <code>/api/jobs/start</code>.
-          </div>
         </fieldset>
 
         <label>

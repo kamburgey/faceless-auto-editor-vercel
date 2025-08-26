@@ -6,75 +6,119 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 const j = (o:any, s=200) => NextResponse.json(o, { status: s })
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5'
-const TTS_MODEL = process.env.ELEVENLABS_TTS_MODEL || 'eleven_multilingual_v2'
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+// ✅ use your existing env var name; fallback kept for safety
+const ELEVEN_MODEL = process.env.ELEVENLABS_TTS_MODEL || 'eleven_turbo_v2_5'
 
-// words/sec for natural TTS pacing (tweak via env if you like)
-const WPS = Number(process.env.WORDS_PER_SEC || 2.6)
+// ---- helpers ----
+function clamp(n:number,min:number,max:number){ return Math.max(min, Math.min(max, n)) }
+
+function mapVoiceSettings(style: string, pace: number, breaths: boolean) {
+  const p = clamp(pace || 1, 0.85, 1.15)
+  if (style === 'energetic') {
+    return { stability: 0.55, similarity_boost: 0.75, style: 75, use_speaker_boost: true }
+  }
+  if (style === 'narrator_warm') {
+    return { stability: 0.5, similarity_boost: 0.8, style: 55, use_speaker_boost: true }
+  }
+  // natural_conversational
+  return { stability: breaths ? 0.45 : 0.5, similarity_boost: 0.8, style: 35, use_speaker_boost: true }
+}
+
+function postProcessForPace(text: string, pace: number, breaths: boolean) {
+  const p = clamp(pace || 1, 0.85, 1.15)
+  let t = text.trim()
+  // Encourage natural line breaks for TTS cadence
+  t = t.replace(/\s*\n+\s*/g, ' ').replace(/\s+/g, ' ')
+  t = t.replace(/([.!?])\s+/g, '$1\n')
+  if (p < 0.98) {
+    t = t.replace(/,\s/g, ', … ')
+    t = t.replace(/:\s/g, ': … ')
+  }
+  if (breaths) {
+    t = t.replace(/\.\n/g, '. …\n')
+  }
+  return t
+}
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({} as any))
-    const topic = (body.topic ?? '').toString().trim()
-    const niche = ((body.niche ?? 'General')).toString().trim() || 'General'
-    const tone = (body.tone ?? 'Informative').toString().trim() || 'Informative'
-    const targetDurationSec = Math.max(10, Number(body.targetDurationSec ?? 30))
+    if (!process.env.OPENAI_API_KEY) return j({ error: 'missing_openai_key' }, 500)
+    if (!process.env.ELEVENLABS_API_KEY) return j({ error: 'missing_elevenlabs_key' }, 500)
+    if (!process.env.BLOB_READ_WRITE_TOKEN) return j({ error: 'missing_blob_token' }, 500)
 
-    if (!topic) return j({ error: 'missing_topic', details: 'Provide a topic' }, 400)
+    const body = await req.json()
+    const {
+      topic,
+      niche = 'general',
+      tone = 'neutral',
+      targetDurationSec = 25,
+      tts = {}
+    } = body as {
+      topic: string
+      niche?: string
+      tone?: string
+      targetDurationSec?: number
+      tts?: { voiceId?: string; style?: string; pace?: number; breaths?: boolean }
+    }
 
-    // compute target words tightly around duration
-    const targetWords = Math.max(45, Math.round(targetDurationSec * WPS))
-    const minWords = Math.round(targetWords * 0.9)
-    const maxWords = Math.round(targetWords * 1.1)
+    if (!topic) return j({ error: 'missing params' }, 400)
 
-    const sys = [
-      'You are a senior YouTube/shorts scriptwriter.',
-      'Write a compelling, voiceover-ready narration for a short-form video.',
-      'Keep advertiser-friendly. Avoid unverifiable claims and tongue twisters.',
-      'Style: cinematic but natural; vivid verbs; sensory details; emotional beats.',
-      'Structure: powerful hook in the first line, clear progression, payoff/insight, concise outro/CTA.',
-      'Formatting: short/medium sentences and paragraphs; no headings, bullets, timestamps, or scene labels.',
-      `Target: ~${targetDurationSec}s. STRICT word range: ${minWords}-${maxWords} words.`
+    // --- 1) Narration (tone + niche + pacing-aware word count) ---
+    const pace = clamp(tts?.pace ?? 1.0, 0.85, 1.15)
+    const wpmBase = 165 // typical neutral narration
+    const targetWPM = Math.round(wpmBase * pace)
+    const targetWords = clamp(Math.round((targetDurationSec / 60) * targetWPM), 60, 230)
+
+    const sys = 'You are a senior short-form video scriptwriter.'
+    const user = [
+      `Write a voiceover-ready script about "${topic}".`,
+      `Niche: ${niche}. Tone: ${tone}. Style: ${tts?.style || 'natural_conversational'}.`,
+      `Target read time: ~${targetDurationSec}s at ~${targetWPM} WPM (~${targetWords} words).`,
+      'Make it punchy and human; use natural cadence, short lines, and commas for micro-pauses.',
+      'No headings, no bullets, no scene labels — just the narration.',
+      'Keep it advertiser-friendly.'
     ].join(' ')
 
-    const user = `Topic: "${topic}". Niche: ${niche}. Tone: ${tone}.
-Write the final narration only.`
-
-    // OpenAI (no temperature flags to keep model-agnostic)
     const narrRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }]
-      })
+      body: JSON.stringify({ model: OPENAI_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] })
     })
     if (!narrRes.ok) return j({ error: 'openai_narration', details: await narrRes.text() }, 500)
-    const narration = (await narrRes.json()).choices[0].message.content as string
+    let narration = (await narrRes.json()).choices?.[0]?.message?.content?.trim() || ''
+    narration = postProcessForPace(narration, pace, !!tts?.breaths)
 
-    // ElevenLabs TTS
-    const tts = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,{
-      method:'POST',
-      headers:{
+    // --- 2) ElevenLabs TTS → MP3 ---
+    const voiceId = (tts?.voiceId && String(tts.voiceId).trim()) || process.env.ELEVENLABS_VOICE_ID
+    if (!voiceId) return j({ error: 'missing_voice_id' }, 500)
+
+    const voice_settings = mapVoiceSettings(tts?.style || 'natural_conversational', pace, !!tts?.breaths)
+
+    const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: 'POST',
+      headers: {
         'xi-api-key': process.env.ELEVENLABS_API_KEY!,
-        'Content-Type':'application/json',
-        'Accept':'audio/mpeg'
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg'
       },
       body: JSON.stringify({
         text: narration,
-        model_id: TTS_MODEL,
-        voice_settings: { stability: 0.5, similarity_boost: 0.85 }
+        model_id: ELEVEN_MODEL,      // <- now uses ELEVENLABS_TTS_MODEL env
+        voice_settings
       })
     })
-    if (!tts.ok) return j({ error:'elevenlabs_tts', details: await tts.text() }, 500)
-    const audioBuf = Buffer.from(await tts.arrayBuffer())
+    if (!ttsRes.ok) return j({ error: 'elevenlabs_tts', details: await ttsRes.text() }, 500)
+    const audioBuf = Buffer.from(await ttsRes.arrayBuffer())
 
+    // --- 3) Upload audio → Blob (public) ---
     const { url: audioUrl } = await put(`audio/${Date.now()}.mp3`, audioBuf, {
-      access:'public', token: process.env.BLOB_READ_WRITE_TOKEN
+      access: 'public',
+      token: process.env.BLOB_READ_WRITE_TOKEN
     })
 
-    return j({ audioUrl, narration })
+    return j({ narration, audioUrl })
   } catch (e:any) {
-    return j({ error:'server_error', message: e?.message || String(e) }, 500)
+    return j({ error: 'server_error', message: e?.message || String(e) }, 500)
   }
 }

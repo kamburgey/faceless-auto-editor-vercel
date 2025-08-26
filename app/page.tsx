@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 type Jobs = { portrait?: string; landscape?: string }
 type Segment = { start: number; end: number; text: string; visualQuery?: string; assetPreference?: 'video'|'image' }
 type Clip = { src: string; start: number; length: number; assetType: 'video' | 'image' }
+type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'  // NEW
 
 export default function Home() {
   // form
@@ -11,7 +12,7 @@ export default function Home() {
   const [niche, setNiche] = useState('food & drink')
   const [tone, setTone] = useState('informative, upbeat')
   const [dur, setDur] = useState<number>(25)
-  const [assetMode, setAssetMode] = useState<'image_only'|'image_first'|'video_first'>('image_first') // NEW
+  const [assetMode, setAssetMode] = useState<AssetMode>('ai') // default to AI preference (auto)
   const [usePortrait, setUsePortrait] = useState(true)
   const [useLandscape, setUseLandscape] = useState(true)
 
@@ -97,21 +98,24 @@ export default function Home() {
       const beats: Segment[] = d25.beats
       setSegments(beats)
 
-      // 3) choose clips per beat (pass visualQuery, assetPreference, and UI assetMode)
+      // 3) choose clips per beat (pass visualQuery, assetPreference, and optional assetMode)
       pushProgress(`3/4 Selecting b-roll… (0/${beats.length})`)
       const chosen: Clip[] = []
       for (let i = 0; i < beats.length; i++) {
         try {
+          const payload: any = {
+            segment: beats[i],
+            visualQuery: beats[i].visualQuery,
+            assetPreference: beats[i].assetPreference,
+            outputs: { portrait: usePortrait, landscape: useLandscape }
+          }
+          // Only send assetMode if not 'ai' (so backend uses storyboard/ENV precedence)
+          if (assetMode !== 'ai') payload.assetMode = assetMode
+
           const r = await fetch('/api/jobs/choose', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              segment: beats[i],
-              visualQuery: beats[i].visualQuery,
-              assetPreference: beats[i].assetPreference,
-              assetMode, // <-- UI override goes to server
-              outputs: { portrait: usePortrait, landscape: useLandscape }
-            })
+            body: JSON.stringify(payload)
           })
           if (!r.ok) throw new Error(await r.text())
           const jr = await safeJson(r)
@@ -132,7 +136,7 @@ export default function Home() {
         body: JSON.stringify({
           clips: chosen,
           audioUrl: d1.audioUrl,
-          captionsUrl: d2.captionsUrl, // still uploaded by STT route even if not burned-in
+          captionsUrl: d2.captionsUrl, // uploaded by STT route even if not burned-in
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })
@@ -192,7 +196,8 @@ export default function Home() {
 
         <label>
           Asset mode
-          <select value={assetMode} onChange={e => setAssetMode(e.target.value as any)} style={{ marginLeft: 8 }}>
+          <select value={assetMode} onChange={e => setAssetMode(e.target.value as AssetMode)} style={{ marginLeft: 8 }}>
+            <option value="ai">AI preference (auto)</option>
             <option value="image_only">Images only (safest)</option>
             <option value="image_first">Images first (fallback to video)</option>
             <option value="video_first">Video first (fallback to image)</option>

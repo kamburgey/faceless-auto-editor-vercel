@@ -6,14 +6,15 @@ type Segment = { start: number; end: number; text: string }
 type Clip = { src: string; start: number; length: number; assetType: 'video' | 'image' }
 
 export default function Home() {
+  // form
   const [topic, setTopic] = useState('')
   const [niche, setNiche] = useState('food & drink')
   const [tone, setTone] = useState('informative, upbeat')
   const [dur, setDur] = useState<number>(25)
-
   const [usePortrait, setUsePortrait] = useState(true)
   const [useLandscape, setUseLandscape] = useState(true)
 
+  // pipeline state
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState<string[]>([])
   const [narration, setNarration] = useState<string | null>(null)
@@ -22,6 +23,7 @@ export default function Home() {
   const [segments, setSegments] = useState<Segment[] | null>(null)
   const [clips, setClips] = useState<Clip[] | null>(null)
 
+  // render/poll
   const [jobs, setJobs] = useState<Jobs>({})
   const [statusP, setStatusP] = useState('')
   const [statusL, setStatusL] = useState('')
@@ -47,6 +49,7 @@ export default function Home() {
       return
     }
 
+    // reset UI
     setRunning(true)
     setProgress([])
     setNarration(null); setAudioUrl(null); setCaptionsUrl(null)
@@ -54,6 +57,7 @@ export default function Home() {
     setJobs({}); setStatusP(''); setStatusL(''); setUrlP(null); setUrlL(null)
 
     try {
+      // 1) narration + tts
       pushProgress('1/4 Narration + TTS…')
       const s1 = await fetch('/api/jobs/start', {
         method: 'POST',
@@ -65,6 +69,7 @@ export default function Home() {
       setNarration(d1.narration || null)
       setAudioUrl(d1.audioUrl || null)
 
+      // 2) stt + captions
       pushProgress('2/4 Transcribing + captions…')
       const s2 = await fetch('/api/jobs/stt', {
         method: 'POST',
@@ -77,30 +82,41 @@ export default function Home() {
       setSegments(segs)
       setCaptionsUrl(d2.captionsUrl || null)
 
+      // 3) choose clips (resilient per-segment)
       pushProgress(`3/4 Selecting b-roll… (0/${segs.length})`)
       const chosen: Clip[] = []
       for (let i = 0; i < segs.length; i++) {
-        const r = await fetch('/api/jobs/choose', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ segment: segs[i], outputs: { portrait: usePortrait, landscape: useLandscape } })
-        })
-        if (!r.ok) throw new Error(await r.text())
-        const jr = await safeJson(r)
-        if (jr?.clip) chosen.push(jr.clip)
+        try {
+          const r = await fetch('/api/jobs/choose', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ segment: segs[i], outputs: { portrait: usePortrait, landscape: useLandscape } })
+          })
+          const ct = r.headers.get('content-type') || ''
+          if (!r.ok) throw new Error(await r.text())
+          const jr = ct.includes('application/json') ? await r.json() : (() => { throw new Error('non-JSON reply') })()
+          if (jr?.clip) {
+            chosen.push(jr.clip)
+          } else if (jr?.error) {
+            pushProgress(`• Segment ${i + 1}: ${jr.error}`)
+          }
+        } catch (err: any) {
+          pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0, 120) || String(err)}`)
+        }
         pushProgress(`3/4 Selecting b-roll… (${i + 1}/${segs.length})`)
       }
-      if (!chosen.length) throw new Error('No clips chosen')
+      if (!chosen.length) { alert('No clips chosen (see Progress for details).'); return }
       setClips(chosen)
 
+      // 4) render
       pushProgress('4/4 Rendering with Shotstack…')
       const r = await fetch('/api/jobs/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           clips: chosen,
-          audioUrl: d2 ? d2.audioUrl || audioUrl : audioUrl,
-          captionsUrl: d2.captionsUrl,
+          audioUrl: audioUrl,            // from step 1
+          captionsUrl: d2.captionsUrl,   // from step 2
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })

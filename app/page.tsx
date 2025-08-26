@@ -59,10 +59,16 @@ export default function Home() {
     try {
       // 1) narration + tts
       pushProgress('1/4 Narration + TTS…')
+      const payload = {
+        topic: topic.trim(),
+        niche: (niche || 'General').trim(),
+        tone: (tone || 'Informative').trim(),
+        targetDurationSec: Number(dur)
+      }
       const s1 = await fetch('/api/jobs/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic, niche, tone, targetDurationSec: Number(dur) })
+        body: JSON.stringify(payload)
       })
       if (!s1.ok) throw new Error(await s1.text())
       const d1 = await safeJson(s1)
@@ -115,8 +121,8 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           clips: chosen,
-          audioUrl: audioUrl,            // from step 1
-          captionsUrl: d2.captionsUrl,   // from step 2
+          audioUrl: d1.audioUrl,        // from step 1
+          captionsUrl: d2.captionsUrl,  // from step 2
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })

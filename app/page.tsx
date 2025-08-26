@@ -6,15 +6,14 @@ type Segment = { start: number; end: number; text: string }
 type Clip = { src: string; start: number; length: number; assetType: 'video' | 'image' }
 
 export default function Home() {
-  // form
   const [topic, setTopic] = useState('')
-  const [niche, setNiche] = useState('General')
-  const [tone, setTone] = useState('Informative')
-  const [dur, setDur] = useState<number>(30)
-  const [usePortrait, setUsePortrait] = useState(true)   // 9:16
-  const [useLandscape, setUseLandscape] = useState(true) // 16:9
+  const [niche, setNiche] = useState('food & drink')
+  const [tone, setTone] = useState('informative, upbeat')
+  const [dur, setDur] = useState<number>(25)
 
-  // pipeline state
+  const [usePortrait, setUsePortrait] = useState(true)
+  const [useLandscape, setUseLandscape] = useState(true)
+
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState<string[]>([])
   const [narration, setNarration] = useState<string | null>(null)
@@ -23,15 +22,21 @@ export default function Home() {
   const [segments, setSegments] = useState<Segment[] | null>(null)
   const [clips, setClips] = useState<Clip[] | null>(null)
 
-  // renders/polling
   const [jobs, setJobs] = useState<Jobs>({})
-  const [statusP, setStatusP] = useState('')  // portrait status
-  const [statusL, setStatusL] = useState('')  // landscape status
+  const [statusP, setStatusP] = useState('')
+  const [statusL, setStatusL] = useState('')
   const [urlP, setUrlP] = useState<string | null>(null)
   const [urlL, setUrlL] = useState<string | null>(null)
 
   function pushProgress(line: string) {
     setProgress(prev => [...prev, line])
+  }
+
+  async function safeJson(res: Response) {
+    const ct = res.headers.get('content-type') || ''
+    if (ct.includes('application/json')) return res.json()
+    const txt = await res.text()
+    throw new Error(txt.slice(0, 200))
   }
 
   async function startJob(e: React.FormEvent) {
@@ -42,7 +47,6 @@ export default function Home() {
       return
     }
 
-    // reset UI
     setRunning(true)
     setProgress([])
     setNarration(null); setAudioUrl(null); setCaptionsUrl(null)
@@ -50,69 +54,58 @@ export default function Home() {
     setJobs({}); setStatusP(''); setStatusL(''); setUrlP(null); setUrlL(null)
 
     try {
-      // 1) narration + TTS + blob
       pushProgress('1/4 Narration + TTS…')
       const s1 = await fetch('/api/jobs/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, niche, tone, targetDurationSec: Number(dur) })
       })
-      if (!s1.ok) throw new Error('Narration/TTS failed')
-      const d1 = await s1.json()
+      if (!s1.ok) throw new Error(await s1.text())
+      const d1 = await safeJson(s1)
       setNarration(d1.narration || null)
       setAudioUrl(d1.audioUrl || null)
 
-      // 2) STT + captions
       pushProgress('2/4 Transcribing + captions…')
       const s2 = await fetch('/api/jobs/stt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audioUrl: d1.audioUrl,
-          targetDurationSec: Number(dur),
-          narration: d1.narration
-        })
+        body: JSON.stringify({ audioUrl: d1.audioUrl, targetDurationSec: Number(dur), narration: d1.narration })
       })
-      if (!s2.ok) throw new Error('Transcription failed')
-      const d2 = await s2.json()
-      setSegments(d2.segments || [])
+      if (!s2.ok) throw new Error(await s2.text())
+      const d2 = await safeJson(s2)
+      const segs: Segment[] = d2.segments || []
+      setSegments(segs)
       setCaptionsUrl(d2.captionsUrl || null)
 
-      // 3) Choose clips (sequential per segment to avoid timeouts)
-      const segs: Segment[] = d2.segments || []
       pushProgress(`3/4 Selecting b-roll… (0/${segs.length})`)
       const chosen: Clip[] = []
       for (let i = 0; i < segs.length; i++) {
-        const seg = segs[i]
         const r = await fetch('/api/jobs/choose', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            segment: seg,
-            outputs: { portrait: usePortrait, landscape: useLandscape }
-          })
+          body: JSON.stringify({ segment: segs[i], outputs: { portrait: usePortrait, landscape: useLandscape } })
         })
-        const jr = await r.json()
+        if (!r.ok) throw new Error(await r.text())
+        const jr = await safeJson(r)
         if (jr?.clip) chosen.push(jr.clip)
         pushProgress(`3/4 Selecting b-roll… (${i + 1}/${segs.length})`)
       }
       if (!chosen.length) throw new Error('No clips chosen')
       setClips(chosen)
 
-      // 4) Render timelines
       pushProgress('4/4 Rendering with Shotstack…')
       const r = await fetch('/api/jobs/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           clips: chosen,
-          audioUrl: d1.audioUrl,
+          audioUrl: d2 ? d2.audioUrl || audioUrl : audioUrl,
           captionsUrl: d2.captionsUrl,
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })
-      if (!r.ok) throw new Error('Render kickoff failed')
-      const d3 = await r.json()
+      if (!r.ok) throw new Error(await r.text())
+      const d3 = await safeJson(r)
       setJobs(d3.jobs || {})
       pushProgress('Queued. Polling render status…')
     } catch (err: any) {
@@ -123,7 +116,7 @@ export default function Home() {
     }
   }
 
-  // watch portrait job
+  // poll 9:16
   useEffect(() => {
     if (!jobs.portrait) return
     setStatusP('queued')
@@ -139,7 +132,7 @@ export default function Home() {
     return () => clearInterval(t)
   }, [jobs.portrait])
 
-  // watch landscape job
+  // poll 16:9
   useEffect(() => {
     if (!jobs.landscape) return
     setStatusL('queued')
@@ -171,7 +164,6 @@ export default function Home() {
         <button type="submit" disabled={running}>{running ? 'Building…' : 'Build'}</button>
       </form>
 
-      {/* Progress */}
       {progress.length > 0 && (
         <div style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
           <b>Progress</b>
@@ -181,17 +173,15 @@ export default function Home() {
         </div>
       )}
 
-      {/* Debug info (optional links) */}
       {(narration || audioUrl || captionsUrl) && (
         <div style={{ marginTop: 12, fontSize: 14 }}>
-          {narration && <div><b>Narration:</b> <span style={{ whiteSpace: 'pre-wrap' }}>{narration}</span></div>}
+          {narration && <div style={{ marginBottom: 8 }}><b>Narration:</b> <span style={{ whiteSpace: 'pre-wrap' }}>{narration}</span></div>}
           {audioUrl && <div><a href={audioUrl} target="_blank" rel="noreferrer">Voiceover (MP3)</a></div>}
           {captionsUrl && <div><a href={captionsUrl} target="_blank" rel="noreferrer">Captions (SRT)</a></div>}
           {segments && <div>Segments: {segments.length}{clips && <> · Clips chosen: {clips.length}</>}</div>}
         </div>
       )}
 
-      {/* Results */}
       {(jobs.portrait || jobs.landscape) && (
         <div style={{ marginTop: 20, display: 'grid', gap: 16 }}>
           {jobs.portrait && (
@@ -207,7 +197,6 @@ export default function Home() {
               )}
             </div>
           )}
-
           {jobs.landscape && (
             <div>
               <div><b>16:9 status:</b> {statusL}</div>

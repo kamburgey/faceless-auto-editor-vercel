@@ -19,7 +19,6 @@ export default function Home() {
   const [progress, setProgress] = useState<string[]>([])
   const [narration, setNarration] = useState<string | null>(null)
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
-  const [captionsUrl, setCaptionsUrl] = useState<string | null>(null)
   const [segments, setSegments] = useState<Segment[] | null>(null)
   const [clips, setClips] = useState<Clip[] | null>(null)
 
@@ -30,30 +29,21 @@ export default function Home() {
   const [urlP, setUrlP] = useState<string | null>(null)
   const [urlL, setUrlL] = useState<string | null>(null)
 
-  function pushProgress(line: string) {
-    setProgress(prev => [...prev, line])
-  }
-
+  function pushProgress(line: string) { setProgress(prev => [...prev, line]) }
   async function safeJson(res: Response) {
     const ct = res.headers.get('content-type') || ''
     if (ct.includes('application/json')) return res.json()
-    const txt = await res.text()
-    throw new Error(txt.slice(0, 200))
+    const txt = await res.text(); throw new Error(txt.slice(0, 200))
   }
 
   async function startJob(e: React.FormEvent) {
     e.preventDefault()
     if (running) return
-    if (!usePortrait && !useLandscape) {
-      alert('Select at least one output (TikTok and/or YouTube).')
-      return
-    }
+    if (!usePortrait && !useLandscape) { alert('Select at least one output.'); return }
 
     // reset UI
-    setRunning(true)
-    setProgress([])
-    setNarration(null); setAudioUrl(null); setCaptionsUrl(null)
-    setSegments(null); setClips(null)
+    setRunning(true); setProgress([])
+    setNarration(null); setAudioUrl(null); setSegments(null); setClips(null)
     setJobs({}); setStatusP(''); setStatusL(''); setUrlP(null); setUrlL(null)
 
     try {
@@ -66,29 +56,24 @@ export default function Home() {
         targetDurationSec: Number(dur)
       }
       const s1 = await fetch('/api/jobs/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       })
       if (!s1.ok) throw new Error(await s1.text())
       const d1 = await safeJson(s1)
-      setNarration(d1.narration || null)
-      setAudioUrl(d1.audioUrl || null)
+      setNarration(d1.narration || null); setAudioUrl(d1.audioUrl || null)
 
-      // 2) stt + captions
-      pushProgress('2/4 Transcribing + captions…')
+      // 2) stt → segments (no captions)
+      pushProgress('2/4 Transcribing (segments)…')
       const s2 = await fetch('/api/jobs/stt', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioUrl: d1.audioUrl, targetDurationSec: Number(dur), narration: d1.narration })
       })
       if (!s2.ok) throw new Error(await s2.text())
       const d2 = await safeJson(s2)
       const segs: Segment[] = d2.segments || []
       setSegments(segs)
-      setCaptionsUrl(d2.captionsUrl || null)
 
-      // 3) choose clips (resilient per-segment)
+      // 3) choose clips (resilient)
       pushProgress(`3/4 Selecting b-roll… (0/${segs.length})`)
       const chosen: Clip[] = []
       for (let i = 0; i < segs.length; i++) {
@@ -101,36 +86,27 @@ export default function Home() {
           const ct = r.headers.get('content-type') || ''
           if (!r.ok) throw new Error(await r.text())
           const jr = ct.includes('application/json') ? await r.json() : (() => { throw new Error('non-JSON reply') })()
-          if (jr?.clip) {
-            chosen.push(jr.clip)
-          } else if (jr?.error) {
-            pushProgress(`• Segment ${i + 1}: ${jr.error}`)
-          }
-        } catch (err: any) {
-          pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0, 120) || String(err)}`)
+          if (jr?.clip) chosen.push(jr.clip)
+          else if (jr?.error) pushProgress(`• Segment ${i + 1}: ${jr.error}`)
+        } catch (err:any) {
+          pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0,120) || String(err)}`)
         }
         pushProgress(`3/4 Selecting b-roll… (${i + 1}/${segs.length})`)
       }
       if (!chosen.length) { alert('No clips chosen (see Progress for details).'); return }
       setClips(chosen)
 
-      // 4) render
+      // 4) render (no captions)
       pushProgress('4/4 Rendering with Shotstack…')
       const r = await fetch('/api/jobs/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clips: chosen,
-          audioUrl: d1.audioUrl,        // from step 1
-          captionsUrl: d2.captionsUrl,  // from step 2
-          outputs: { portrait: usePortrait, landscape: useLandscape }
-        })
+        body: JSON.stringify({ clips: chosen, audioUrl: d1.audioUrl, outputs: { portrait: usePortrait, landscape: useLandscape } })
       })
       if (!r.ok) throw new Error(await r.text())
       const d3 = await safeJson(r)
-      setJobs(d3.jobs || {})
-      pushProgress('Queued. Polling render status…')
-    } catch (err: any) {
+      setJobs(d3.jobs || {}); pushProgress('Queued. Polling render status…')
+    } catch (err:any) {
       console.error(err)
       alert(`Failed to start job. ${err?.message || String(err)}`)
     } finally {
@@ -179,27 +155,22 @@ export default function Home() {
         <label>Niche <input value={niche} onChange={e => setNiche(e.target.value)} required /></label>
         <label>Tone <input value={tone} onChange={e => setTone(e.target.value)} placeholder="Informative, playful, dramatic…" /></label>
         <label>Target Duration (sec) <input type="number" min={10} value={dur} onChange={e => setDur(Number(e.target.value))} /></label>
-
         <label><input type="checkbox" checked={usePortrait} onChange={e => setUsePortrait(e.target.checked)} /> Generate TikTok (9:16)</label>
         <label><input type="checkbox" checked={useLandscape} onChange={e => setUseLandscape(e.target.checked)} /> Generate YouTube (16:9)</label>
-
         <button type="submit" disabled={running}>{running ? 'Building…' : 'Build'}</button>
       </form>
 
       {progress.length > 0 && (
         <div style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
           <b>Progress</b>
-          <ol style={{ marginTop: 8 }}>
-            {progress.map((p, i) => <li key={i}>{p}</li>)}
-          </ol>
+          <ol style={{ marginTop: 8 }}>{progress.map((p,i)=><li key={i}>{p}</li>)}</ol>
         </div>
       )}
 
-      {(narration || audioUrl || captionsUrl) && (
+      {(narration || audioUrl) && (
         <div style={{ marginTop: 12, fontSize: 14 }}>
           {narration && <div style={{ marginBottom: 8 }}><b>Narration:</b> <span style={{ whiteSpace: 'pre-wrap' }}>{narration}</span></div>}
           {audioUrl && <div><a href={audioUrl} target="_blank" rel="noreferrer">Voiceover (MP3)</a></div>}
-          {captionsUrl && <div><a href={captionsUrl} target="_blank" rel="noreferrer">Captions (SRT)</a></div>}
           {segments && <div>Segments: {segments.length}{clips && <> · Clips chosen: {clips.length}</>}</div>}
         </div>
       )}
@@ -211,9 +182,7 @@ export default function Home() {
               <div><b>9:16 status:</b> {statusP}</div>
               {urlP && (
                 <>
-                  <div style={{ marginTop: 8 }}>
-                    <video src={urlP} controls style={{ width: '100%', borderRadius: 12 }} />
-                  </div>
+                  <div style={{ marginTop: 8 }}><video src={urlP} controls style={{ width: '100%', borderRadius: 12 }} /></div>
                   <a href={urlP} target="_blank" rel="noreferrer">Open 9:16</a>
                 </>
               )}
@@ -224,9 +193,7 @@ export default function Home() {
               <div><b>16:9 status:</b> {statusL}</div>
               {urlL && (
                 <>
-                  <div style={{ marginTop: 8 }}>
-                    <video src={urlL} controls style={{ width: '100%', borderRadius: 12 }} />
-                  </div>
+                  <div style={{ marginTop: 8 }}><video src={urlL} controls style={{ width: '100%', borderRadius: 12 }} /></div>
                   <a href={urlL} target="_blank" rel="noreferrer">Open 16:9</a>
                 </>
               )}

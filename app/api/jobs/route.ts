@@ -9,7 +9,7 @@ const MAX_CANDIDATES_PER_SEGMENT = 5
 const FRAMES_PER_CANDIDATE = 2
 
 type Segment = { start: number; end: number; text: string }
-type ClipPick = { src: string; start: number; length: number }
+type ClipPick = { src: string; start: number; length: number; assetType: 'video' | 'image' }
 
 // --- helpers ---
 function tcode(sec: number) {
@@ -88,7 +88,7 @@ Keep 110–150 words, punchy, high-retention. Output script only.`
       token: process.env.BLOB_READ_WRITE_TOKEN
     })
 
-    // 4) Transcribe → segments (and words if we want later)
+    // 4) Transcribe → segments (+ words)
     const fd = new FormData()
     fd.append('file', new Blob([audioBuf], { type: 'audio/mpeg' }), 'voiceover.mp3')
     fd.append('model', 'whisper-1')
@@ -120,45 +120,95 @@ Keep 110–150 words, punchy, high-retention. Output script only.`
       token: process.env.BLOB_READ_WRITE_TOKEN
     })
 
-    // 6) For each segment: search Pexels → pick best via GPT-5 vision on frames
+    // 6) For each segment: search Pexels → (video first, photo fallback) → pick best via GPT-5 vision on frames
     const headers = { Authorization: process.env.PEXELS_API_KEY! }
     const chosenClips: ClipPick[] = []
+    const aspectHints: string[] = []
+    if (outputs?.portrait) aspectHints.push('9:16')
+    if (outputs?.landscape) aspectHints.push('16:9')
+    const aspectText = aspectHints.length ? `Target aspect ratio(s): ${aspectHints.join(' & ')}.\n` : ''
 
     for (const s of segs) {
-      // (a) search candidates
-      const q = encodeURIComponent(s.text) // simple baseline; you can LLM-refine queries later
-      const resp = await fetch(`https://api.pexels.com/videos/search?query=${q}&per_page=${MAX_CANDIDATES_PER_SEGMENT * 2}`, { headers })
-      if (!resp.ok) continue
-      const data = await resp.json()
-      const uniq: any[] = []
-      const seen = new Set()
-      for (const v of (data.videos || [])) {
-        if (seen.has(v.id)) continue
-        seen.add(v.id)
-        uniq.push(v)
+      const segLen = clamp(s.end - s.start, 1.5, 7)
+
+      // --- video candidates ---
+      const vr = await fetch(
+        `https://api.pexels.com/videos/search?query=${encodeURIComponent(s.text)}&per_page=${MAX_CANDIDATES_PER_SEGMENT * 2}`,
+        { headers }
+      )
+
+      let candidates: Array<{
+        id: number|string
+        src: string
+        duration: number
+        frames: string[]
+        assetType: 'video'|'image'
+        width?: number
+        height?: number
+      }> = []
+
+      if (vr.ok) {
+        const vd = await vr.json()
+        const uniq: any[] = []
+        const seen = new Set()
+        for (const v of (vd.videos || [])) {
+          if (seen.has(v.id)) continue
+          seen.add(v.id)
+          uniq.push(v)
+        }
+        candidates = uniq.slice(0, MAX_CANDIDATES_PER_SEGMENT).map((v: any) => {
+          const file = pickSdFile(v)
+          const frames = pickFrames(v.video_pictures || [], FRAMES_PER_CANDIDATE)
+          const cover = v.image ? [v.image] : []
+          return {
+            id: v.id,
+            src: file?.link,
+            duration: v.duration || segLen,
+            frames: frames.length ? frames : cover,
+            assetType: 'video' as const,
+            width: v.width, height: v.height
+          }
+        }).filter((c: any) => !!c.src)
       }
-      const candidates = uniq.slice(0, MAX_CANDIDATES_PER_SEGMENT).map((v: any) => {
-        const file = pickSdFile(v)
-        const frames = pickFrames(v.video_pictures || [], FRAMES_PER_CANDIDATE)
-        const cover = v.image ? [v.image] : []
-        return { id: v.id, src: file?.link, duration: v.duration || 5, frames: frames.length ? frames : cover }
-      }).filter((c: any) => !!c.src)
+
+      // --- photo fallback if no video candidates ---
+      if (!candidates.length) {
+        const pr = await fetch(
+          `https://api.pexels.com/v1/search?query=${encodeURIComponent(s.text)}&per_page=${MAX_CANDIDATES_PER_SEGMENT}`,
+          { headers }
+        )
+        if (pr.ok) {
+          const pd = await pr.json()
+          candidates = (pd.photos || []).map((p: any) => ({
+            id: p.id,
+            src: p.src?.original || p.src?.large2x || p.src?.large,
+            duration: segLen, // still holds over the whole segment
+            frames: [p.src?.medium || p.src?.large || p.src?.original].filter(Boolean),
+            assetType: 'image' as const,
+            width: p.width, height: p.height
+          })).filter((c: any) => !!c.src)
+        }
+      }
 
       if (!candidates.length) continue
 
-      // (b) ask GPT-5 (vision) to pick the best candidate using frames
-      // Build a single multimodal message: brief text + frames grouped per candidate
+      // --- ask GPT-5 (vision) to pick best candidate using frames ---
       const content: any[] = [
         {
           type: 'text',
-          text: `You're picking b-roll for this narration segment:\n"${s.text}"\n` +
-                `The clip must feel relevant, engaging, and high-energy where appropriate. Duration window: ${clamp(s.end - s.start, 1.5, 7).toFixed(1)}s.\n` +
-                `Score candidates for: (1) semantic relevance, (2) visual clarity/framing, (3) motion/energy fit, (4) safe/brand-friendly.\n` +
-                `Return strict JSON: {"best_index": <0-based integer>, "reason": "<short>"}`
+          text:
+            `You're selecting b-roll for this narration segment:\n"${s.text}"\n` +
+            aspectText +
+            `Choose the candidate that best fits: ` +
+            `(1) semantic relevance, (2) visual clarity/framing, (3) motion/energy fit, (4) safe/brand-friendly, ` +
+            `(5) orientation suitability for the target aspect(s).\n` +
+            `Return strict JSON: {"best_index": <0-based integer>, "reason": "<short>"}`
         }
       ]
+
       candidates.forEach((c, i) => {
-        content.push({ type: 'text', text: `Candidate ${i} (id ${c.id}) – sample frames:` })
+        const orient = c.width && c.height ? (c.width > c.height ? 'landscape' : (c.width < c.height ? 'portrait' : 'square')) : 'unknown'
+        content.push({ type: 'text', text: `Candidate ${i} (id ${c.id}) – ${c.assetType.toUpperCase()}, ${orient}, ~${c.duration.toFixed(1)}s. Frames:` })
         c.frames.slice(0, FRAMES_PER_CANDIDATE).forEach((u: string) => {
           content.push({ type: 'image_url', image_url: { url: u } })
         })
@@ -186,8 +236,8 @@ Keep 110–150 words, punchy, high-retention. Output script only.`
       }
 
       const chosen = candidates[bestIdx]
-      const segLen = clamp(s.end - s.start, 1.5, chosen.duration || 6)
-      chosenClips.push({ src: chosen.src, start: s.start, length: segLen })
+      const len = clamp(segLen, 1.5, chosen.duration || segLen)
+      chosenClips.push({ src: chosen.src, start: s.start, length: len, assetType: chosen.assetType })
     }
 
     if (!chosenClips.length) return j({ error: 'no_clips_chosen' }, 400)
@@ -200,7 +250,7 @@ Keep 110–150 words, punchy, high-retention. Output script only.`
         tracks: [
           {
             clips: chosenClips.map(c => ({
-              asset: { type: 'video', src: c.src, trim: 0 },
+              asset: { type: c.assetType, src: c.src, ...(c.assetType === 'video' ? { trim: 0 } : {}) },
               start: c.start,
               length: c.length,
               fit: 'cover',

@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react'
 
 type Jobs = { portrait?: string; landscape?: string }
+
 type Segment = {
   start: number
   end: number
@@ -11,18 +12,30 @@ type Segment = {
 }
 type Clip = { src: string; start: number; length: number; assetType: 'video' | 'image' }
 type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'
+type VOStyle = 'natural_conversational' | 'narrator_warm' | 'energetic'
+
+const DEFAULT_UI_VOICE =
+  process.env.NEXT_PUBLIC_ELEVENLABS_VOICE_ID || 'wBXNqKUATyqu0RtYt25i'
 
 export default function Home() {
-  // form
+  // ---------- form ----------
   const [topic, setTopic] = useState('')
   const [niche, setNiche] = useState('food & drink')
   const [tone, setTone] = useState('informative, upbeat')
   const [dur, setDur] = useState<number>(25)
+
+  // voiceover controls (these are sent to /api/jobs/start -> tts)
+  const [voiceId, setVoiceId] = useState<string>(DEFAULT_UI_VOICE)
+  const [voStyle, setVoStyle] = useState<VOStyle>('natural_conversational')
+  const [voPace, setVoPace] = useState<number>(0.95) // slower = more natural cadence
+  const [voBreaths, setVoBreaths] = useState<boolean>(true)
+
+  // asset selection controls
   const [assetMode, setAssetMode] = useState<AssetMode>('ai') // AI preference (auto)
   const [usePortrait, setUsePortrait] = useState(true)
   const [useLandscape, setUseLandscape] = useState(true)
 
-  // pipeline state
+  // ---------- pipeline state ----------
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState<string[]>([])
   const [narration, setNarration] = useState<string | null>(null)
@@ -31,7 +44,7 @@ export default function Home() {
   const [segments, setSegments] = useState<Segment[] | null>(null)
   const [clips, setClips] = useState<Clip[] | null>(null)
 
-  // render/poll
+  // ---------- render/poll ----------
   const [jobs, setJobs] = useState<Jobs>({})
   const [statusP, setStatusP] = useState('')
   const [statusL, setStatusL] = useState('')
@@ -39,6 +52,7 @@ export default function Home() {
   const [urlL, setUrlL] = useState<string | null>(null)
 
   const pushProgress = (line: string) => setProgress(prev => [...prev, line])
+  const fmt = (n: number) => (Math.round(n * 10) / 10).toFixed(1)
 
   const safeJson = async (res: Response) => {
     const ct = res.headers.get('content-type') || ''
@@ -68,7 +82,19 @@ export default function Home() {
       const s1 = await fetch('/api/jobs/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic, niche, tone, targetDurationSec: Number(dur) })
+        body: JSON.stringify({
+          topic,
+          niche,
+          tone,
+          targetDurationSec: Number(dur),
+          // Voiceover knobs (server now honors these)
+          tts: {
+            voiceId: voiceId?.trim() || undefined,
+            style: voStyle,       // 'natural_conversational' | 'narrator_warm' | 'energetic'
+            pace: voPace,         // 0.85–1.15 typical
+            breaths: voBreaths    // hint to add natural pauses
+          }
+        })
       })
       if (!s1.ok) throw new Error(await s1.text())
       const d1 = await safeJson(s1)
@@ -86,7 +112,7 @@ export default function Home() {
       const d2 = await safeJson(s2)
       setCaptionsUrl(d2.captionsUrl || null)
 
-      // 2.5) Storyboard with min/max beat length
+      // 2.5) Storyboard with min/max beat length (LLM)
       pushProgress('2.5/4 Planning visuals per sentence…')
       const s25 = await fetch('/api/jobs/plan', {
         method: 'POST',
@@ -133,7 +159,7 @@ export default function Home() {
       if (!chosen.length) { alert('No clips chosen (see Progress).'); return }
       setClips(chosen)
 
-      // 4) render with correct asset types (image/video)
+      // 4) render
       pushProgress('4/4 Rendering with Shotstack…')
       const r = await fetch('/api/jobs/render', {
         method: 'POST',
@@ -141,7 +167,7 @@ export default function Home() {
         body: JSON.stringify({
           clips: chosen,
           audioUrl: d1.audioUrl,
-          captionsUrl: d2.captionsUrl, // uploaded by STT (we’re not burning them into video)
+          captionsUrl: d2.captionsUrl, // uploaded by STT (not burned-in)
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })
@@ -199,6 +225,45 @@ export default function Home() {
         <label>Tone <input value={tone} onChange={e => setTone(e.target.value)} placeholder="Informative, playful, dramatic…" /></label>
         <label>Target Duration (sec) <input type="number" min={10} value={dur} onChange={e => setDur(Number(e.target.value))} /></label>
 
+        <fieldset style={{ border:'1px solid #333', borderRadius:8, padding:10 }}>
+          <legend>Voiceover</legend>
+          <label>
+            ElevenLabs Voice ID
+            <input
+              value={voiceId}
+              onChange={e => setVoiceId(e.target.value)}
+              placeholder="wBXNqKUATyqu0RtYt25i"
+              style={{ marginLeft: 8, width: 290 }}
+            />
+          </label>
+          <label style={{ marginLeft: 12 }}>
+            Style{' '}
+            <select value={voStyle} onChange={e => setVoStyle(e.target.value as VOStyle)} style={{ marginLeft: 6 }}>
+              <option value="natural_conversational">Natural · conversational</option>
+              <option value="narrator_warm">Narrator · warm</option>
+              <option value="energetic">Energetic · punchy</option>
+            </select>
+          </label>
+          <label style={{ marginLeft: 12 }}>
+            Pace: <code>{voPace.toFixed(2)}×</code>
+            <input
+              type="range"
+              min={0.85}
+              max={1.15}
+              step={0.01}
+              value={voPace}
+              onChange={e => setVoPace(Number(e.target.value))}
+              style={{ marginLeft: 6, verticalAlign: 'middle' }}
+            />
+          </label>
+          <label style={{ marginLeft: 12 }}>
+            <input type="checkbox" checked={voBreaths} onChange={e => setVoBreaths(e.target.checked)} /> Natural pauses/breaths
+          </label>
+          <div style={{ fontSize: 12, opacity: .7, marginTop: 6 }}>
+            These hints are honored by the TTS step in <code>/api/jobs/start</code>.
+          </div>
+        </fieldset>
+
         <label>
           Asset mode
           <select value={assetMode} onChange={e => setAssetMode(e.target.value as AssetMode)} style={{ marginLeft: 8 }}>
@@ -231,6 +296,30 @@ export default function Home() {
           {captionsUrl && <div><a href={captionsUrl} target="_blank" rel="noreferrer">Captions (SRT)</a></div>}
           {segments && <div>Segments: {segments.length}{clips && <> · Clips chosen: {clips.length}</>}</div>}
         </div>
+      )}
+
+      {/* Storyboard debug panel */}
+      {segments && segments.length > 0 && (
+        <details style={{ marginTop: 12 }}>
+          <summary style={{ cursor: 'pointer' }}>
+            Storyboard debug (LLM visual queries) — {segments.length} beats
+          </summary>
+          <ol style={{ marginTop: 8, lineHeight: 1.4 }}>
+            {segments.map((b, i) => {
+              const chosen = clips?.[i]; // best-effort alignment
+              return (
+                <li key={i}>
+                  <code>[{fmt(b.start)}–{fmt(b.end)}s]</code>{' '}
+                  <b>{(b.assetPreference || 'auto').toUpperCase()}</b>{' '}
+                  — <i>{b.visualQuery || '(no query)'}</i>
+                  {chosen && (
+                    <> · chosen: <b>{chosen.assetType}</b> · {fmt(chosen.length)}s</>
+                  )}
+                </li>
+              )
+            })}
+          </ol>
+        </details>
       )}
 
       {(jobs.portrait || jobs.landscape) && (

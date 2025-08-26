@@ -5,7 +5,7 @@ export const dynamic = 'force-dynamic'
 const j = (o: any, s = 200) => NextResponse.json(o, { status: s })
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5'
-const MAX_CANDIDATES_PER_SEGMENT = 3
+const MAX_CANDIDATES_PER_SEGMENT = 5
 const FRAMES_PER_CANDIDATE = 2
 
 type Segment = { start: number; end: number; text: string }

@@ -37,82 +37,105 @@ export default function Home() {
   }
 
   async function startJob(e: React.FormEvent) {
-    e.preventDefault()
-    if (running) return
-    if (!usePortrait && !useLandscape) { alert('Select at least one output.'); return }
-
-    // reset UI
-    setRunning(true); setProgress([])
-    setNarration(null); setAudioUrl(null); setSegments(null); setClips(null)
-    setJobs({}); setStatusP(''); setStatusL(''); setUrlP(null); setUrlL(null)
-
-    try {
-      // 1) narration + tts
-      pushProgress('1/4 Narration + TTS…')
-      const payload = {
-        topic: topic.trim(),
-        niche: (niche || 'General').trim(),
-        tone: (tone || 'Informative').trim(),
-        targetDurationSec: Number(dur)
-      }
-      const s1 = await fetch('/api/jobs/start', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-      })
-      if (!s1.ok) throw new Error(await s1.text())
-      const d1 = await safeJson(s1)
-      setNarration(d1.narration || null); setAudioUrl(d1.audioUrl || null)
-
-      // 2) stt → segments (no captions)
-      pushProgress('2/4 Transcribing (segments)…')
-      const s2 = await fetch('/api/jobs/stt', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audioUrl: d1.audioUrl, targetDurationSec: Number(dur), narration: d1.narration })
-      })
-      if (!s2.ok) throw new Error(await s2.text())
-      const d2 = await safeJson(s2)
-      const segs: Segment[] = d2.segments || []
-      setSegments(segs)
-
-      // 3) choose clips (resilient)
-      pushProgress(`3/4 Selecting b-roll… (0/${segs.length})`)
-      const chosen: Clip[] = []
-      for (let i = 0; i < segs.length; i++) {
-        try {
-          const r = await fetch('/api/jobs/choose', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ segment: segs[i], outputs: { portrait: usePortrait, landscape: useLandscape } })
-          })
-          const ct = r.headers.get('content-type') || ''
-          if (!r.ok) throw new Error(await r.text())
-          const jr = ct.includes('application/json') ? await r.json() : (() => { throw new Error('non-JSON reply') })()
-          if (jr?.clip) chosen.push(jr.clip)
-          else if (jr?.error) pushProgress(`• Segment ${i + 1}: ${jr.error}`)
-        } catch (err:any) {
-          pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0,120) || String(err)}`)
-        }
-        pushProgress(`3/4 Selecting b-roll… (${i + 1}/${segs.length})`)
-      }
-      if (!chosen.length) { alert('No clips chosen (see Progress for details).'); return }
-      setClips(chosen)
-
-      // 4) render (no captions)
-      pushProgress('4/4 Rendering with Shotstack…')
-      const r = await fetch('/api/jobs/render', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clips: chosen, audioUrl: d1.audioUrl, outputs: { portrait: usePortrait, landscape: useLandscape } })
-      })
-      if (!r.ok) throw new Error(await r.text())
-      const d3 = await safeJson(r)
-      setJobs(d3.jobs || {}); pushProgress('Queued. Polling render status…')
-    } catch (err:any) {
-      console.error(err)
-      alert(`Failed to start job. ${err?.message || String(err)}`)
-    } finally {
-      setRunning(false)
-    }
+  e.preventDefault()
+  if (running) return
+  if (!usePortrait && !useLandscape) {
+    alert('Select at least one output (TikTok and/or YouTube).')
+    return
   }
+
+  // reset UI
+  setRunning(true)
+  setProgress([])
+  setNarration(null); setAudioUrl(null); setCaptionsUrl(null)
+  setSegments(null); setClips(null)
+  setJobs({}); setStatusP(''); setStatusL(''); setUrlP(null); setUrlL(null)
+
+  try {
+    // 1) narration + TTS
+    pushProgress('1/4 Narration + TTS…')
+    const s1 = await fetch('/api/jobs/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, niche, tone, targetDurationSec: Number(dur) })
+    })
+    if (!s1.ok) throw new Error(await s1.text())
+    const d1 = await s1.json()
+    setNarration(d1.narration || null)
+    setAudioUrl(d1.audioUrl || null)
+
+    // 2) STT (segments + words)
+    pushProgress('2/4 Transcribing (segments + words)…')
+    const s2 = await fetch('/api/jobs/stt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audioUrl: d1.audioUrl })
+    })
+    if (!s2.ok) throw new Error(await s2.text())
+    const d2 = await s2.json()
+    setCaptionsUrl(d2.captionsUrl || null)
+
+    // 2.5) LLM scene beats (re-segmentation)
+    pushProgress('2.5/4 Finding smart scene beats…')
+    const s25 = await fetch('/api/jobs/resegment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transcript: d2.transcript,
+        segments: d2.segments,
+        words: d2.words,
+        targetDurationSec: Number(dur)
+      })
+    })
+    if (!s25.ok) throw new Error(await s25.text())
+    const d25 = await s25.json()
+    const beats = d25.beats || d2.segments
+    setSegments(beats)
+
+    // 3) choose clips per beat
+    pushProgress(`3/4 Selecting b-roll… (0/${beats.length})`)
+    const chosen: Clip[] = []
+    for (let i = 0; i < beats.length; i++) {
+      try {
+        const r = await fetch('/api/jobs/choose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segment: beats[i], outputs: { portrait: usePortrait, landscape: useLandscape } })
+        })
+        if (!r.ok) throw new Error(await r.text())
+        const jr = await r.json()
+        if (jr?.clip) chosen.push(jr.clip)
+      } catch (err:any) {
+        pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0,120) || String(err)}`)
+      }
+      pushProgress(`3/4 Selecting b-roll… (${i + 1}/${beats.length})`)
+    }
+    if (!chosen.length) { alert('No clips chosen (see Progress).'); return }
+    setClips(chosen)
+
+    // 4) render
+    pushProgress('4/4 Rendering with Shotstack…')
+    const r = await fetch('/api/jobs/render', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clips: chosen,
+        audioUrl: d1.audioUrl,
+        captionsUrl: d2.captionsUrl,
+        outputs: { portrait: usePortrait, landscape: useLandscape }
+      })
+    })
+    if (!r.ok) throw new Error(await r.text())
+    const d3 = await r.json()
+    setJobs(d3.jobs || {})
+    pushProgress('Queued. Polling render status…')
+  } catch (err:any) {
+    console.error(err)
+    alert(`Failed to start job. ${err?.message || String(err)}`)
+  } finally {
+    setRunning(false)
+  }
+}
 
   // poll 9:16
   useEffect(() => {

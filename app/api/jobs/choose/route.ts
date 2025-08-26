@@ -5,17 +5,29 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 const j = (o: any, s = 200) => NextResponse.json(o, { status: s })
 
+// ---- config ----
 const MAX_CANDIDATES = 6
 const FRAMES_PER_CANDIDATE = 2
-const SMART_PICK = process.env.SMART_PICK === '1'
-const SMART_QUERY = process.env.SMART_QUERY === '1'
-const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-5-mini'
-const OPENAI_REWRITE_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini'
-const SMART_PICK_TIMEOUT_MS = Number(process.env.SMART_PICK_TIMEOUT_MS || 15000)
-const SMART_QUERY_TIMEOUT_MS = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
+
+const SMART_PICK  = process.env.SMART_PICK === '1'         // GPT-vision re-rank
+const SMART_QUERY = process.env.SMART_QUERY === '1'        // LLM query rewrite
+
+const OPENAI_VISION_MODEL  = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'
+const OPENAI_REWRITE_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+
+const SMART_PICK_TIMEOUT_MS   = Number(process.env.SMART_PICK_TIMEOUT_MS  || 15000)
+const SMART_QUERY_TIMEOUT_MS  = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
 
 // strict coverage: ensure every beat is visually covered fully
-const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0' // default on
+const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0' // default ON
+
+// emergency fallbacks if main query returns nothing
+const EMERGENCY_QUERIES = [
+  'abstract gradient background',
+  'soft bokeh lights background',
+  'minimal texture background',
+  'dark gradient backdrop'
+]
 
 const clamp = (n:number,min:number,max:number)=>Math.max(min,Math.min(max,n))
 const pickSdFile = (v:any)=> (v?.video_files||[]).find((f:any)=>f.quality==='sd') ?? (v?.video_files||[])[0]
@@ -41,14 +53,18 @@ type Cand = {
   duration?: number
   frames?: string[]
 }
-function scoreCandidate(c: Cand, want: 'portrait'|'landscape'|'any'){
+function scoreCandidate(c: Cand, want: 'portrait'|'landscape'|'any', segLen:number){
   let s = 0
   const o = orientationOf(c.width, c.height)
   if (want !== 'any') {
     if (o === want) s += 3
     else if (o === 'square' || o === 'unknown') s += 1
   } else s += 1
-  if (c.assetType === 'video') s += 2
+  if (c.assetType === 'video') {
+    s += 2
+    // penalize videos that can't cover most of the beat
+    if ((c.duration || 0) < segLen * 0.85) s -= 3
+  }
   if (c.src) s += 1
   return s
 }
@@ -59,7 +75,7 @@ async function rewriteQuery(raw: string, want: 'portrait'|'landscape'|'any'): Pr
   const controller = new AbortController()
   const to = setTimeout(()=>controller.abort(), SMART_QUERY_TIMEOUT_MS)
   try {
-    const sys = 'Extract 2–5 visual stock-search terms (objects, actions, setting, mood). Return JSON: {"terms":[...]}'
+    const sys = 'Extract 3–6 concrete visual stock-search terms (objects, actions, setting, mood). Return JSON: {"terms":[...]}'
     const user = `Line: "${raw}"  Orientation: ${want}. Avoid abstract words; prefer concrete visuals.`
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -84,32 +100,22 @@ async function rewriteQuery(raw: string, want: 'portrait'|'landscape'|'any'): Pr
   }
 }
 
-// photo search helper
-async function searchPhotoCandidate(query:string, headers:any, want:'portrait'|'landscape'|'any', segLen:number): Promise<Cand|null> {
-  const orientationParam =
-    want === 'portrait' ? '&orientation=portrait' :
-    want === 'landscape' ? '&orientation=landscape' : ''
+async function searchPhotos(query:string, headers:any){
   const pr = await fetch(
-    `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES}${orientationParam}`,
+    `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES}`,
     { headers, cache:'no-store' }
   )
-  if (!pr.ok) return null
+  if (!pr.ok) return []
   const pd = await pr.json()
-  const photos: Cand[] = (pd.photos || [])
-    .map((p:any)=>({
-      id:p.id,
-      src: p.src?.original || p.src?.large2x || p.src?.large,
-      assetType:'image' as const,
-      width:p.width, height:p.height,
-      duration: segLen,
-      frames: [p.src?.medium || p.src?.large || p.src?.original].filter(Boolean)
-    }))
-    .filter((c:Cand)=>!!c.src)
-  if (!photos.length) return null
-  const idx = photos.map((c,i)=>({i,s:scoreCandidate(c,want)})).sort((a,b)=>b.s-a.s)[0]?.i ?? 0
-  return photos[idx]
+  return (pd.photos || []).map((p:any)=>({
+    id:p.id,
+    src: p.src?.original || p.src?.large2x || p.src?.large,
+    assetType:'image' as const,
+    width:p.width, height:p.height
+  })).filter((c:Cand)=>!!c.src)
 }
 
+// ---- main ----
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.PEXELS_API_KEY) return j({ error:'missing_pexels_key' }, 500)
@@ -119,11 +125,14 @@ export async function POST(req: NextRequest) {
     }
     if (!segment?.text || segment.start==null || segment.end==null) return j({ error:'bad_segment_payload' }, 400)
 
-    const segLen = clamp(segment.end - segment.start, 1.5, 7)
+    // ✅ use the exact beat length — no upper clamp
+    const segLen = Math.max(1.5, (segment.end - segment.start))
+
     const want: 'portrait'|'landscape'|'any' =
       outputs?.portrait && !outputs?.landscape ? 'portrait'
       : (!outputs?.portrait && outputs?.landscape) ? 'landscape'
-      : 'landscape'
+      : 'landscape' // both -> lean landscape
+
     const headers = { Authorization: process.env.PEXELS_API_KEY as string }
 
     const baseQuery = await rewriteQuery(segment.text, want)
@@ -146,7 +155,7 @@ export async function POST(req: NextRequest) {
           return {
             id:v.id, src:file?.link, assetType:'video' as const,
             width:v.width, height:v.height,
-            duration:v.duration || segLen,
+            duration:v.duration || 0,
             frames: frames.length ? frames : cover
           }
         }).filter((c:Cand)=>!!c.src)
@@ -155,11 +164,16 @@ export async function POST(req: NextRequest) {
 
     // 2) fallback to photos if no videos
     if (!candidates.length) {
-      const photo = await searchPhotoCandidate(baseQuery, headers, want, segLen)
-      if (photo) candidates = [photo]
+      for (const q of [baseQuery, ...EMERGENCY_QUERIES]) {
+        const photos = await searchPhotos(q, headers)
+        if (photos.length) { candidates = photos; break }
+      }
     }
 
-    if (!candidates.length) return j({ error:'no_candidates' }, 200)
+    if (!candidates.length) {
+      // last-last resort: return a dummy black frame via a known-good Pexels query
+      return j({ clip: { src: 'https://images.pexels.com/photos/35600/road-sun-rays-path.jpg', start: segment.start, length: segLen, assetType: 'image' } })
+    }
 
     // 3) pick: SMART (vision) or heuristic
     let chosenIdx = 0
@@ -176,7 +190,7 @@ Return strict JSON: {"best_index": <0-based>, "reason": "<short>"}.`
         }]
         candidates.forEach((c,i)=>{
           const orient = orientationOf(c.width, c.height)
-          content.push({ type:'text', text:`Candidate ${i} – ${c.assetType.toUpperCase()} · ${orient} · ~${(c.duration||segLen).toFixed(1)}s` })
+          content.push({ type:'text', text:`Candidate ${i} – ${c.assetType.toUpperCase()} · ${orient} · ${(c.duration||0).toFixed(1)}s` })
           ;(c.frames||[]).slice(0, FRAMES_PER_CANDIDATE).forEach(u=> content.push({ type:'image_url', image_url:{ url:u } }))
         })
 
@@ -205,27 +219,27 @@ Return strict JSON: {"best_index": <0-based>, "reason": "<short>"}.`
     if (SMART_PICK && process.env.OPENAI_API_KEY) {
       chosenIdx = await pickWithVision()
       if (chosenIdx === 0) {
-        const idx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want) }))
+        const idx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want, segLen) }))
           .sort((a,b)=>b.s-a.s)[0]?.i ?? 0
         chosenIdx = idx
       }
     } else {
-      chosenIdx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want) }))
+      chosenIdx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want, segLen) }))
         .sort((a,b)=>b.s-a.s)[0]?.i ?? 0
     }
 
     let chosen = candidates[chosenIdx]
 
-    // ---- STRICT COVERAGE: if chosen video is shorter than the beat, auto-swap to a photo ----
+    // ---- STRICT COVERAGE: if chosen video is shorter than the beat, auto-swap to a photo of same query ----
     if (STRICT_COVERAGE && chosen.assetType === 'video' && (chosen.duration || 0) < segLen - 0.05) {
-      const photo = await searchPhotoCandidate(baseQuery, headers, want, segLen)
-      if (photo) chosen = photo
+      for (const q of [baseQuery, ...EMERGENCY_QUERIES]) {
+        const photos = await searchPhotos(q, headers)
+        if (photos.length) { chosen = photos[0]; break }
+      }
     }
 
-    // Always return full beat length so there can be no gaps
-    const length = segLen
-
-    return j({ clip: { src: chosen.src, start: segment.start, length, assetType: chosen.assetType } })
+    // Always return the full beat length so visuals fully cover the VO
+    return j({ clip: { src: chosen.src, start: segment.start, length: segLen, assetType: chosen.assetType } })
   } catch (e:any) {
     return j({ error:'server_error', message: e?.message || String(e) }, 500)
   }

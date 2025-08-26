@@ -37,11 +37,24 @@ Keep 110–150 words, punchy, high-retention. Output script only.`
     const narration = (await narrRes.json()).choices[0].message.content as string
 
     // 2) TTS
-    const tts = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,{
-      method:'POST',
-      headers:{'xi-api-key':process.env.ELEVENLABS_API_KEY!, 'Content-Type':'application/json', 'Accept':'audio/mpeg'},
-      body: JSON.stringify({ text:narration, model_id:'eleven_multilingual_v2', voice_settings:{stability:0.5, similarity_boost:0.8} })
-    })
+    // ...
+const ttsModel = process.env.ELEVENLABS_TTS_MODEL || 'eleven_multilingual_v2'
+
+const tts = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,{
+  method:'POST',
+  headers:{
+    'xi-api-key': process.env.ELEVENLABS_API_KEY!,
+    'Content-Type':'application/json',
+    'Accept':'audio/mpeg'
+  },
+  body: JSON.stringify({
+    text: narration,
+    model_id: ttsModel,          // <-- now controlled by env
+    voice_settings: { stability: 0.5, similarity_boost: 0.8 }
+  })
+})
+// ...
+
     if (!tts.ok) return j({ error:'elevenlabs_tts', details: await tts.text() }, 500)
     const audioBuf = Buffer.from(await tts.arrayBuffer())
 

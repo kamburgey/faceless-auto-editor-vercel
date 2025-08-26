@@ -1,88 +1,77 @@
-
 import { NextRequest, NextResponse } from 'next/server'
+import { put } from '@vercel/blob'
 
 export const dynamic = 'force-dynamic'
+const j = (o: any, s = 200) => NextResponse.json(o, { status: s })
 
-const j = (o: any, s=200) => NextResponse.json(o, { status: s })
+type Segment = { start: number; end: number; text: string }
+
+// hh:mm:ss,mmm
+function tcode(sec: number) {
+  const ms = Math.max(0, Math.round(sec * 1000))
+  const h = Math.floor(ms / 3600000).toString().padStart(2, '0')
+  const m = Math.floor((ms % 3600000) / 60000).toString().padStart(2, '0')
+  const s = Math.floor((ms % 60000) / 1000).toString().padStart(2, '0')
+  const mm = (ms % 1000).toString().padStart(3, '0')
+  return `${h}:${m}:${s},${mm}`
+}
+function segmentsToSrt(segs: Segment[]) {
+  return segs
+    .map((s, i) => `${i + 1}\n${tcode(s.start)} --> ${tcode(s.end)}\n${s.text.replace(/\r?\n/g, ' ').trim()}\n`)
+    .join('\n')
+}
+
+// pick an sd file (fast) from Pexels video
+function pickFile(v: any) {
+  if (!v?.video_files?.length) return null
+  return v.video_files.find((f: any) => f.quality === 'sd') ?? v.video_files[0]
+}
 
 export async function POST(req: NextRequest) {
   try {
-    const { topic, niche, targetDurationSec } = await req.json()
-    if (!topic || !niche || !targetDurationSec) return j({ error: 'missing params' }, 400)
+    const { topic, niche, tone = 'Informative', targetDurationSec = 30, outputs = { portrait: true, landscape: true } } =
+      await req.json()
 
-    // 1) LLM: beat sheet JSON
-    const prompt = `Make a concise beat sheet for a ${targetDurationSec}s video on "${topic}" in the "${niche}" niche.
-Return strictly JSON: {"beats":[{"caption":string,"query":string,"durationSec":number}]}. Use 5-9 beats, sum durations to ~${targetDurationSec}.`
+    if (!topic || !niche) return j({ error: 'missing params' }, 400)
 
-    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+    // 1) Draft narration text (tone-aware)
+    const narrationPrompt = `Write a ${targetDurationSec}s short-form voiceover about "${topic}" for the "${niche}" niche with a ${tone} tone.
+Keep 110–150 words, punchy, high-retention. Output script only.`
+    const narrRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: narrationPrompt }] })
+    })
+    if (!narrRes.ok) return j({ error: 'openai_narration', details: await narrRes.text() }, 500)
+    const narration = (await narrRes.json()).choices[0].message.content as string
+
+    // 2) ElevenLabs TTS → mp3 bytes
+    const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
+        'xi-api-key': process.env.ELEVENLABS_API_KEY!,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: prompt }],
-        response_format: { type: 'json_object' }
+        text: narration,
+        model_id: 'eleven_multilingual_v2',
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 }
       })
     })
-    if (!openaiRes.ok) {
-      const msg = await openaiRes.text().catch(()=> '')
-      return j({ error: 'openai_failed', details: msg }, 500)
-    }
-    const beatsMsg = await openaiRes.json()
-    const beats = JSON.parse(beatsMsg.choices[0].message.content).beats as {caption:string,query:string,durationSec:number}[]
+    if (!ttsRes.ok) return j({ error: 'elevenlabs_tts', details: await ttsRes.text() }, 500)
+    const audioBuf = Buffer.from(await ttsRes.arrayBuffer())
 
-    // 2) Pexels: get one clip per beat
-    const headers = { Authorization: process.env.PEXELS_API_KEY as string }
-    const clips: { src: string; start: number; length: number }[] = []
-    let cursor = 0
-    for (const b of beats) {
-      const sr = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(b.query)}&per_page=3`, { headers })
-      if (!sr.ok) continue
-      const data = await sr.json()
-      const first = data.videos?.[0]
-      if (!first) continue
-      const file = first.video_files?.find((f:any)=>f.quality==='sd') || first.video_files?.[0]
-      if (!file?.link) continue
-      const length = Math.max(2, Math.min(b.durationSec || 3, first.duration || b.durationSec || 3))
-      clips.push({ src: file.link, start: cursor, length })
-      cursor += length
-    }
-
-    if (clips.length === 0) return j({ error: 'no_clips_found' }, 400)
-
-    // 3) Shotstack timeline
-    const timeline = {
-      timeline: {
-        background: '#000000',
-        tracks: [{
-          clips: clips.map(c => ({
-            asset: { type: 'video', src: c.src, trim: 0 },
-            start: c.start,
-            length: c.length,
-            fit: 'cover',
-            transition: { in: 'fade', out: 'fade' }
-          }))
-        }]
-      },
-      output: { format: 'mp4', resolution: 'sd' }
-    }
-
-    const renderRes = await fetch('https://api.shotstack.io/stage/render', {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.SHOTSTACK_API_KEY as string,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(timeline)
+    // 3) Host audio (public) via Vercel Blob (Shotstack needs a URL)
+    const { url: audioUrl } = await put(`audio/${Date.now()}.mp3`, audioBuf, {
+      access: 'public',
+      token: process.env.BLOB_READ_WRITE_TOKEN
     })
-    const renderJson = await renderRes.json()
-    const jobId = renderJson?.response?.id
-    if (!jobId) return j({ error: 'shotstack_failed', details: renderJson }, 500)
 
-    return j({ jobId })
-  } catch (e:any) {
-    return j({ error: 'server_error', message: e?.message || String(e) }, 500)
-  }
-}
+    // 4) Transcribe to get timed segments (we’ll use segment timestamps for clip timing + captions)
+    const fd = new FormData()
+    fd.append('file', new Blob([audioBuf], { type: 'audio/mpeg' }), 'voiceover.mp3')
+    fd.append('model', 'whisper-1')                 // verbose JSON returns segments w/ start/end
+    fd.append('response_format', 'verbose_json')
+    const stt = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: '

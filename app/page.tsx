@@ -2,9 +2,15 @@
 import { useEffect, useState } from 'react'
 
 type Jobs = { portrait?: string; landscape?: string }
-type Segment = { start: number; end: number; text: string; visualQuery?: string; assetPreference?: 'video'|'image' }
+type Segment = {
+  start: number
+  end: number
+  text: string
+  visualQuery?: string
+  assetPreference?: 'video' | 'image'
+}
 type Clip = { src: string; start: number; length: number; assetType: 'video' | 'image' }
-type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'  // NEW
+type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'
 
 export default function Home() {
   // form
@@ -12,7 +18,7 @@ export default function Home() {
   const [niche, setNiche] = useState('food & drink')
   const [tone, setTone] = useState('informative, upbeat')
   const [dur, setDur] = useState<number>(25)
-  const [assetMode, setAssetMode] = useState<AssetMode>('ai') // default to AI preference (auto)
+  const [assetMode, setAssetMode] = useState<AssetMode>('ai') // AI preference (auto)
   const [usePortrait, setUsePortrait] = useState(true)
   const [useLandscape, setUseLandscape] = useState(true)
 
@@ -69,7 +75,7 @@ export default function Home() {
       setNarration(d1.narration || null)
       setAudioUrl(d1.audioUrl || null)
 
-      // 2) STT
+      // 2) STT (segments+words)
       pushProgress('2/4 Transcribing (segments + words)…')
       const s2 = await fetch('/api/jobs/stt', {
         method: 'POST',
@@ -80,7 +86,7 @@ export default function Home() {
       const d2 = await safeJson(s2)
       setCaptionsUrl(d2.captionsUrl || null)
 
-      // 2.5) Storyboard (sentence-aligned + visual queries)
+      // 2.5) Storyboard with min/max beat length
       pushProgress('2.5/4 Planning visuals per sentence…')
       const s25 = await fetch('/api/jobs/plan', {
         method: 'POST',
@@ -98,7 +104,7 @@ export default function Home() {
       const beats: Segment[] = d25.beats
       setSegments(beats)
 
-      // 3) choose clips per beat (pass visualQuery, assetPreference, and optional assetMode)
+      // 3) choose clips for each beat
       pushProgress(`3/4 Selecting b-roll… (0/${beats.length})`)
       const chosen: Clip[] = []
       for (let i = 0; i < beats.length; i++) {
@@ -109,8 +115,7 @@ export default function Home() {
             assetPreference: beats[i].assetPreference,
             outputs: { portrait: usePortrait, landscape: useLandscape }
           }
-          // Only send assetMode if not 'ai' (so backend uses storyboard/ENV precedence)
-          if (assetMode !== 'ai') payload.assetMode = assetMode
+          if (assetMode !== 'ai') payload.assetMode = assetMode // only override if user chose a mode
 
           const r = await fetch('/api/jobs/choose', {
             method: 'POST',
@@ -128,7 +133,7 @@ export default function Home() {
       if (!chosen.length) { alert('No clips chosen (see Progress).'); return }
       setClips(chosen)
 
-      // 4) render
+      // 4) render with correct asset types (image/video)
       pushProgress('4/4 Rendering with Shotstack…')
       const r = await fetch('/api/jobs/render', {
         method: 'POST',
@@ -136,7 +141,7 @@ export default function Home() {
         body: JSON.stringify({
           clips: chosen,
           audioUrl: d1.audioUrl,
-          captionsUrl: d2.captionsUrl, // uploaded by STT route even if not burned-in
+          captionsUrl: d2.captionsUrl, // uploaded by STT (we’re not burning them into video)
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })

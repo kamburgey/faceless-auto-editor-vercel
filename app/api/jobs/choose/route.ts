@@ -14,8 +14,8 @@ const OPENAI_VISION_MODEL  = process.env.OPENAI_VISION_MODEL || process.env.OPEN
 const OPENAI_REWRITE_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
 const SMART_PICK_TIMEOUT_MS  = Number(process.env.SMART_PICK_TIMEOUT_MS  || 15000)
 const SMART_QUERY_TIMEOUT_MS = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
-const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0'
-const ASSET_MODE = (process.env.ASSET_MODE || 'image_first').toLowerCase() // 'image_only' | 'image_first' | 'video_first'
+const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0' // default ON
+const ASSET_MODE_ENV = (process.env.ASSET_MODE || 'image_first').toLowerCase() // env fallback
 
 type Cand = { id:string|number; src:string; assetType:'video'|'image'; width?:number; height?:number; duration?:number; frames?:string[] }
 const clamp = (n:number,min:number,max:number)=>Math.max(min,Math.min(max,n))
@@ -91,11 +91,12 @@ async function searchPhotos(query:string, headers:any){
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.PEXELS_API_KEY) return j({ error:'missing_pexels_key' }, 500)
-    const { segment, outputs, visualQuery, assetPreference } = await req.json() as {
+    const { segment, outputs, visualQuery, assetPreference, assetMode } = await req.json() as {
       segment: { start:number; end:number; text:string },
       outputs?: { portrait?: boolean, landscape?: boolean },
       visualQuery?: string,
-      assetPreference?: 'video'|'image'
+      assetPreference?: 'video'|'image',
+      assetMode?: 'image_only'|'image_first'|'video_first' // <-- UI override
     }
     if (!segment?.text || segment.start==null || segment.end==null) return j({ error:'bad_segment_payload' }, 400)
 
@@ -107,23 +108,31 @@ export async function POST(req: NextRequest) {
 
     const headers = { Authorization: process.env.PEXELS_API_KEY as string }
 
+    // Effective mode: UI override > env
+    const mode = (assetMode || ASSET_MODE_ENV) as 'image_only'|'image_first'|'video_first'
+
+    // Preference: if UI provided a mode, it wins; else defer to AI preference; else env default
+    let prefer: 'video'|'image'|null = null
+    if (assetMode) {
+      prefer = mode === 'video_first' ? 'video' : 'image'
+    } else if (assetPreference) {
+      prefer = assetPreference
+    } else {
+      prefer = mode === 'video_first' ? 'video' : (mode === 'image_only' || mode === 'image_first' ? 'image' : null)
+    }
+
+    // Search order
+    const tryPhotosFirst = assetMode
+      ? (mode !== 'video_first')                   // UI says image_only/image_first => photos first
+      : (assetPreference ? assetPreference==='image' : (ASSET_MODE_ENV !== 'video_first'))
+
     const baseQ = (visualQuery && visualQuery.trim()) ? visualQuery.trim() : segment.text
     const q = await rewriteQuery(baseQ)
 
-    const prefer: 'video'|'image'|null =
-      assetPreference ? assetPreference :
-      ASSET_MODE==='image_only' ? 'image' :
-      ASSET_MODE==='image_first' ? 'image' :
-      ASSET_MODE==='video_first' ? 'video' : null
-
-    // decide search order
-    const tryPhotosFirst = ASSET_MODE==='image_only' || ASSET_MODE==='image_first' || prefer==='image'
-
     let candidates:Cand[] = []
-
     if (tryPhotosFirst) {
       candidates = await searchPhotos(q, headers)
-      if (!candidates.length && ASSET_MODE!=='image_only') candidates = await searchVideos(q, headers)
+      if (!candidates.length && mode !== 'image_only') candidates = await searchVideos(q, headers)
     } else {
       candidates = await searchVideos(q, headers)
       if (!candidates.length) candidates = await searchPhotos(q, headers)
@@ -131,7 +140,7 @@ export async function POST(req: NextRequest) {
 
     if (!candidates.length) return j({ error:'no_candidates' }, 200)
 
-    // pick best
+    // pick
     let idx = 0
     async function pickVision(): Promise<number>{
       const ctrl = new AbortController()
@@ -142,7 +151,7 @@ export async function POST(req: NextRequest) {
           text:`Pick the most relevant b-roll for this narration segment: "${segment.text}"
 Query: "${q}"
 Preferred asset: ${prefer || 'none'}; Target aspect: ${want}.
-Rank for: (1) semantic match, (2) clarity/framing, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation. 
+Rank for: (1) semantic match, (2) clarity/framing, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation.
 Return JSON: {"best_index": <0-based>}.`
         }]
         candidates.forEach((c,i)=>{
@@ -180,9 +189,8 @@ Return JSON: {"best_index": <0-based>}.`
       if (photos.length) chosen = photos[0]
     }
 
-    // Cover the full beat length; video will be trimmed to segLen during render
     return j({ clip: { src: chosen.src, start: segment.start, length: segLen, assetType: chosen.assetType } })
   } catch (e:any) {
-    return j({ error:'server_error', message:e?.message || String(e) }, 500)
+    return j({ error:'server_error', message: e?.message || String(e) }, 500)
   }
 }

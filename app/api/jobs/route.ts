@@ -74,4 +74,97 @@ Keep 110–150 words, punchy, high-retention. Output script only.`
     fd.append('model', 'whisper-1')                 // verbose JSON returns segments w/ start/end
     fd.append('response_format', 'verbose_json')
     const stt = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: '
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: fd
+    }).then(r => r.json())
+
+    const segs: Segment[] =
+      stt?.segments?.map((s: any) => ({
+        start: Math.max(0, Number(s.start) || 0),
+        end: Math.max(Number(s.end) || 0, (Number(s.start) || 0) + 1.5),
+        text: String(s.text || '').trim()
+      })) ?? []
+
+    // fallback if no segments
+    if (!segs.length) {
+      const avg = Math.max(1.5, targetDurationSec / 6)
+      for (let i = 0; i < 6; i++) segs.push({ start: i * avg, end: (i + 1) * avg, text: narration })
+    }
+
+    // 5) Build captions (SRT) and upload
+    const srt = segmentsToSrt(segs)
+    const { url: captionsUrl } = await put(`captions/${Date.now()}.srt`, Buffer.from(srt, 'utf-8'), {
+      access: 'public',
+      token: process.env.BLOB_READ_WRITE_TOKEN
+    })
+
+    // 6) For each segment, fetch a supporting clip from Pexels (video preferred)
+    const headers = { Authorization: process.env.PEXELS_API_KEY! }
+    const clips: { src: string; start: number; length: number }[] = []
+
+    for (const s of segs) {
+      // use segment text as the query (good baseline); you can refine later with LLM-generated keywords
+      const r = await fetch(
+        `https://api.pexels.com/videos/search?query=${encodeURIComponent(s.text)}&per_page=5`,
+        { headers }
+      )
+      if (!r.ok) continue
+      const data = await r.json()
+      const v = data.videos?.[0]
+      const file = pickFile(v)
+      if (!file?.link) continue
+      const len = Math.max(1.5, Math.min((s.end - s.start) || 2.5, (v?.duration ?? 5)))
+      clips.push({ src: file.link, start: s.start, length: len })
+    }
+
+    if (!clips.length) return j({ error: 'no_clips_found' }, 400)
+
+    // 7) Build Shotstack timelines (9:16 + 16:9) with soundtrack + captions
+    const makeTimeline = (aspectRatio: '9:16' | '16:9') => ({
+      timeline: {
+        background: '#000000',
+        soundtrack: { src: audioUrl, effect: 'fadeOut' },
+        tracks: [
+          {
+            clips: clips.map(c => ({
+              asset: { type: 'video', src: c.src, trim: 0 },
+              start: c.start,
+              length: c.length,
+              fit: 'cover',
+              transition: { in: 'fade', out: 'fade' }
+            }))
+          },
+          {
+            clips: [
+              {
+                asset: { type: 'caption', src: captionsUrl },
+                start: 0,
+                length: segs[segs.length - 1].end + 0.5
+              }
+            ]
+          }
+        ]
+      },
+      output: { format: 'mp4', resolution: 'hd', aspectRatio }
+    })
+
+    async function render(tl: any) {
+      const r = await fetch('https://api.shotstack.io/stage/render', {
+        method: 'POST',
+        headers: { 'x-api-key': process.env.SHOTSTACK_API_KEY!, 'Content-Type': 'application/json' },
+        body: JSON.stringify(tl)
+      })
+      const j = await r.json()
+      return j?.response?.id as string | undefined
+    }
+
+    const jobs: { portrait?: string; landscape?: string } = {}
+    if (outputs?.portrait) jobs.portrait = await render(makeTimeline('9:16'))
+    if (outputs?.landscape) jobs.landscape = await render(makeTimeline('16:9'))
+
+    return j({ jobs, audioUrl, captionsUrl, narration })
+  } catch (e: any) {
+    return j({ error: 'server_error', message: e?.message || String(e) }, 500)
+  }
+}

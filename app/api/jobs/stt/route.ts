@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { put } from '@vercel/blob'
 
 export const runtime='nodejs'
 export const dynamic='force-dynamic'
@@ -7,13 +6,6 @@ export const maxDuration=60
 const j=(o:any,s=200)=>NextResponse.json(o,{status:s})
 
 type Segment={start:number;end:number;text:string}
-
-const t=(n:number)=>String(n).padStart(2,'0')
-const tc=(sec:number)=>{
-  const ms=Math.max(0,Math.round(sec*1000))
-  return `${t(Math.floor(ms/3600000))}:${t(Math.floor(ms%3600000/60000))}:${t(Math.floor(ms%60000/1000))},${String(ms%1000).padStart(3,'0')}`
-}
-const toSrt=(segs:Segment[])=>segs.map((s,i)=>`${i+1}\n${tc(s.start)} --> ${tc(s.end)}\n${s.text.replace(/\r?\n/g,' ').trim()}\n`).join('\n')
 
 // merge tiny Whisper segments into ~6–8 beats
 function mergeSegments(raw: Segment[], minLen=3.0, maxSegs=8): Segment[] {
@@ -33,7 +25,6 @@ function mergeSegments(raw: Segment[], minLen=3.0, maxSegs=8): Segment[] {
     }
   }
   out.push(cur)
-  // if still too many, merge the shortest adjacent spans
   while (out.length > maxSegs && out.length > 1) {
     let bestIdx = 0, bestSpan = Infinity
     for (let i = 0; i < out.length - 1; i++) {
@@ -53,7 +44,7 @@ function mergeSegments(raw: Segment[], minLen=3.0, maxSegs=8): Segment[] {
 export async function POST(req: NextRequest) {
   try {
     const { audioUrl, targetDurationSec=30, narration } = await req.json()
-    if (!audioUrl) return j({error:'missing audioUrl'},400)
+    if (!audioUrl) return j({error:'missing_audioUrl'},400)
 
     const audio = await fetch(audioUrl)
     if (!audio.ok) return j({error:'fetch_audio_failed', details: await audio.text()}, 500)
@@ -82,16 +73,9 @@ export async function POST(req: NextRequest) {
       segs = Array.from({length:6},(_,i)=>({start:i*avg,end:(i+1)*avg,text:narration||''}))
     }
 
-    // ↓ NEW: coalesce tiny segments
     segs = mergeSegments(segs, 3.0, 8)
 
-    const srt = toSrt(segs)
-    const { url: captionsUrl } = await put(`captions/${Date.now()}.srt`, Buffer.from(srt,'utf-8'), {
-      access:'public',
-      token:process.env.BLOB_READ_WRITE_TOKEN
-    })
-
-    return j({ segments: segs, captionsUrl })
+    return j({ segments: segs })
   } catch(e:any) {
     return j({error:'server_error', message:e?.message || String(e)},500)
   }

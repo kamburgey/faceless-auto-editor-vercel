@@ -11,21 +11,18 @@ function makeTimeline(audioUrl:string, clips:Clip[], aspectRatio:'9:16'|'16:9'){
   return {
     timeline: {
       background: '#000000',
-      // Remove fadeOut so audio runs to the exact end of visuals
-      soundtrack: { src: audioUrl, volume: 1 },
+      soundtrack: { src: audioUrl, volume: 1 }, // no fadeOut
       tracks: [
         {
           clips: clips.map(c => ({
             asset: {
               type: c.assetType === 'image' ? 'image' : 'video',
               src: c.src,
-              // mute any source audio to keep VO clean
-              ...(c.assetType === 'video' ? { volume: 0 } : {})
+              ...(c.assetType === 'video' ? { volume: 0, trim: 0 } : {}) // hard trim from 0
             },
             start: c.start,
             length: c.length,
             fit: 'cover'
-            // hard cuts (no transition)
           }))
         }
       ]

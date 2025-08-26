@@ -18,13 +18,12 @@ function makeTimeline(audioUrl:string, clips:Clip[], aspectRatio:'9:16'|'16:9'){
             asset: {
               type: c.assetType === 'image' ? 'image' : 'video',
               src: c.src,
-              // mute any source audio so VO is clean
-              ...(c.assetType === 'video' ? { volume: 0 } : {})
+              ...(c.assetType === 'video' ? { volume: 0 } : {}) // mute any source audio
             },
             start: c.start,
             length: c.length,
-            fit: 'cover',
-            transition: { in: 'fade', out: 'fade' }
+            fit: 'cover'
+            // no transition -> hard cuts
           }))
         }
       ]

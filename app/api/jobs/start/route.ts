@@ -19,7 +19,6 @@ export async function POST(req: NextRequest) {
 
     if (!topic) return j({ error: 'missing_topic', details: 'Provide a topic' }, 400)
 
-    // --- narration: emotive, VO-ready, short-form ---
     const sys = [
       'You are a senior YouTube/shorts scriptwriter.',
       'Write a compelling, voiceover-ready narration for a short-form video.',
@@ -33,20 +32,19 @@ export async function POST(req: NextRequest) {
     const user = `Topic: "${topic}". Niche: ${niche}. Tone: ${tone}.
 Write the final narration only.`
 
+    // --- OpenAI (no temperature/reasoning flags) ---
     const narrRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: OPENAI_MODEL,
-        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
-        reasoning_effort: 'medium',
-        temperature: 0.8
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }]
       })
     })
     if (!narrRes.ok) return j({ error: 'openai_narration', details: await narrRes.text() }, 500)
     const narration = (await narrRes.json()).choices[0].message.content as string
 
-    // --- TTS (model from env) ---
+    // --- ElevenLabs TTS ---
     const tts = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,{
       method:'POST',
       headers:{

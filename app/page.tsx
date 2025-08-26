@@ -1,6 +1,8 @@
 'use client'
 import { useEffect, useState } from 'react'
 
+const [usedIds, setUsedIds] = useState<string[]>([])
+
 type Jobs = { portrait?: string; landscape?: string }
 
 type Segment = {
@@ -67,6 +69,8 @@ export default function Home() {
       alert('Select at least one output (TikTok and/or YouTube).')
       return
     }
+
+    setUsedIds([])
 
     // reset
     setRunning(true)
@@ -138,7 +142,8 @@ export default function Home() {
             segment: beats[i],
             visualQuery: beats[i].visualQuery,
             assetPreference: beats[i].assetPreference,
-            outputs: { portrait: usePortrait, landscape: useLandscape }
+            outputs: { portrait: usePortrait, landscape: useLandscape },
+            excludeIds: usedIds,
           }
           if (assetMode !== 'ai') payload.assetMode = assetMode // only override if user chose a mode
 
@@ -150,6 +155,7 @@ export default function Home() {
           if (!r.ok) throw new Error(await r.text())
           const jr = await safeJson(r)
           if (jr?.clip) chosen.push(jr.clip)
+          if (jr.pickedId) setUsedIds(prev => [...prev, String(jr.pickedId)]) // <— NEW
         } catch (err: any) {
           pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0,120) || String(err)}`)
         }

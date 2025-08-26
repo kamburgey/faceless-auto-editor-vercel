@@ -17,7 +17,16 @@ const SMART_QUERY_TIMEOUT_MS = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500
 const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0' // default ON
 const ASSET_MODE_ENV = (process.env.ASSET_MODE || 'image_first').toLowerCase() // env fallback
 
-type Cand = { id:string|number; src:string; assetType:'video'|'image'; width?:number; height?:number; duration?:number; frames?:string[] }
+type Cand = {
+  id:string|number
+  src:string
+  assetType:'video'|'image'
+  width?:number
+  height?:number
+  duration?:number
+  frames?:string[]
+}
+
 const clamp = (n:number,min:number,max:number)=>Math.max(min,Math.min(max,n))
 const pickSd = (v:any)=> (v?.video_files||[]).find((f:any)=>f.quality==='sd') ?? (v?.video_files||[])[0]
 const framesFrom = (pics:any[], k:number)=>!Array.isArray(pics)||!pics.length?[]:pics.slice(0, k).map((p:any)=>p.picture)
@@ -77,14 +86,20 @@ async function searchVideos(query:string, headers:any){
   }
   return out
 }
+
 async function searchPhotos(query:string, headers:any){
   const r = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES}`, { headers, cache:'no-store' })
   if (!r.ok) return []
   const d = await r.json()
-  const out:Cand[] = (d.photos||[]).map((p:any)=>({
-    id:p.id, src:p.src?.original||p.src?.large2x||p.src?.large, assetType:'image',
-    width:p.width, height:p.height, duration:0, frames:[p.src?.medium||p.src?.large||p.src?.original].filter(Boolean)
-  })).filter(c=>!!c.src)
+  const out:Cand[] = (d.photos||[])
+    .map((p:any)=>({
+      id:p.id,
+      src: p.src?.original || p.src?.large2x || p.src?.large,
+      assetType:'image' as const,
+      width:p.width, height:p.height, duration:0,
+      frames:[p.src?.medium || p.src?.large || p.src?.original].filter(Boolean)
+    }))
+    .filter((c: Cand) => !!c.src) // <-- typed filter callback
   return out
 }
 
@@ -96,7 +111,7 @@ export async function POST(req: NextRequest) {
       outputs?: { portrait?: boolean, landscape?: boolean },
       visualQuery?: string,
       assetPreference?: 'video'|'image',
-      assetMode?: 'image_only'|'image_first'|'video_first' // <-- UI override
+      assetMode?: 'image_only'|'image_first'|'video_first'
     }
     if (!segment?.text || segment.start==null || segment.end==null) return j({ error:'bad_segment_payload' }, 400)
 
@@ -111,7 +126,7 @@ export async function POST(req: NextRequest) {
     // Effective mode: UI override > env
     const mode = (assetMode || ASSET_MODE_ENV) as 'image_only'|'image_first'|'video_first'
 
-    // Preference: if UI provided a mode, it wins; else defer to AI preference; else env default
+    // Preference: UI > storyboard > env
     let prefer: 'video'|'image'|null = null
     if (assetMode) {
       prefer = mode === 'video_first' ? 'video' : 'image'
@@ -121,9 +136,8 @@ export async function POST(req: NextRequest) {
       prefer = mode === 'video_first' ? 'video' : (mode === 'image_only' || mode === 'image_first' ? 'image' : null)
     }
 
-    // Search order
     const tryPhotosFirst = assetMode
-      ? (mode !== 'video_first')                   // UI says image_only/image_first => photos first
+      ? (mode !== 'video_first')
       : (assetPreference ? assetPreference==='image' : (ASSET_MODE_ENV !== 'video_first'))
 
     const baseQ = (visualQuery && visualQuery.trim()) ? visualQuery.trim() : segment.text
@@ -183,7 +197,7 @@ Return JSON: {"best_index": <0-based>}.`
 
     let chosen = candidates[idx]
 
-    // Strict coverage: if video too short for this beat, swap to an image
+    // Strict coverage: if video too short, swap to an image
     if (STRICT_COVERAGE && chosen.assetType==='video' && (chosen.duration||0) < segLen-0.05) {
       const photos = await searchPhotos(q, headers)
       if (photos.length) chosen = photos[0]

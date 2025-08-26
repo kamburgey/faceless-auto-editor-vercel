@@ -5,205 +5,240 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 const j = (o:any, s=200) => NextResponse.json(o, { status: s })
 
-// config
-const MAX_CANDIDATES = 6
-const FRAMES = 1
-const SMART_PICK  = process.env.SMART_PICK === '1'
-const SMART_QUERY = process.env.SMART_QUERY === '1'
-const OPENAI_VISION_MODEL  = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'
-const OPENAI_REWRITE_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
-const SMART_PICK_TIMEOUT_MS  = Number(process.env.SMART_PICK_TIMEOUT_MS  || 15000)
-const SMART_QUERY_TIMEOUT_MS = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
-const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0' // default ON
-const ASSET_MODE_ENV = (process.env.ASSET_MODE || 'image_first').toLowerCase() // env fallback
+// ---- config ----
+const MAX_CANDIDATES = 12
+const FRAMES_PER_CANDIDATE = 2
+const SMART_PICK = process.env.SMART_PICK === '1'
+const OPENAI_MODEL = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'
+const SMART_PICK_TIMEOUT_MS = Number(process.env.SMART_PICK_TIMEOUT_MS || 15000)
 
+type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'
 type Cand = {
-  id:string|number
-  src:string
-  assetType:'video'|'image'
-  width?:number
-  height?:number
-  duration?:number
-  frames?:string[]
+  id: string
+  src: string
+  assetType: 'video'|'image'
+  width?: number
+  height?: number
+  duration?: number
+  frames?: string[]
+  photographer?: string
 }
 
 const clamp = (n:number,min:number,max:number)=>Math.max(min,Math.min(max,n))
-const pickSd = (v:any)=> (v?.video_files||[]).find((f:any)=>f.quality==='sd') ?? (v?.video_files||[])[0]
-const framesFrom = (pics:any[], k:number)=>!Array.isArray(pics)||!pics.length?[]:pics.slice(0, k).map((p:any)=>p.picture)
-const orient = (w?:number,h?:number)=>!w||!h?'unknown':(w>h?'landscape':(h>w?'portrait':'square'))
+const orientationOf = (w?:number,h?:number)=>{
+  if (!w || !h) return 'unknown'
+  if (w > h) return 'landscape'
+  if (h > w) return 'portrait'
+  return 'square'
+}
+const pickSdFile = (v:any)=> (v?.video_files||[]).find((f:any)=>f.quality==='sd') ?? (v?.video_files||[])[0]
+const framesFrom = (pics:any[], count:number)=>{
+  if (!Array.isArray(pics) || !pics.length) return []
+  if (pics.length<=count) return pics.map((p:any)=>p.picture)
+  const step=Math.max(1,Math.floor(pics.length/count))
+  const out:string[]=[]; for(let i=0;i<pics.length && out.length<count;i+=step) out.push(pics[i].picture)
+  return out
+}
+const uniqueBy = <T, K>(arr:T[], key:(x:T)=>K) => {
+  const seen = new Set<K>()
+  const out:T[] = []
+  for (const it of arr) {
+    const k = key(it)
+    if (seen.has(k)) continue
+    seen.add(k); out.push(it)
+  }
+  return out
+}
 
-function score(c:Cand, want:'portrait'|'landscape'|'any', segLen:number, prefer:'video'|'image'|null){
+function baseScore(c: Cand, want: 'portrait'|'landscape'|'any', mode: AssetMode){
   let s = 0
-  const o = orient(c.width, c.height)
-  if (want!=='any') s += (o===want?3:(o==='square'||o==='unknown'?1:0)); else s+=1
-  if (prefer && c.assetType===prefer) s += 3
-  if (c.assetType==='video') {
-    s += 2
-    if ((c.duration||0) < segLen*0.85) s -= 3
-  }
-  if (c.src) s += 1
+  const o = orientationOf(c.width, c.height)
+  if (want !== 'any') {
+    if (o === want) s += 4
+    else if (o === 'square' || o === 'unknown') s += 2
+  } else s += 1
+
+  // mode preference
+  if (mode === 'video_first' && c.assetType === 'video') s += 3
+  if (mode === 'image_first' && c.assetType === 'image') s += 3
+  // image_only handled by filtering, ai handled outside
+
+  // basic quality
+  if ((c.width||0) >= 720) s += 1
+  if ((c.height||0) >= 1280 && o==='portrait') s += 1
+
   return s
-}
-
-async function rewriteQuery(q:string){
-  if (!SMART_QUERY || !process.env.OPENAI_API_KEY) return q
-  const ctrl = new AbortController()
-  const to = setTimeout(()=>ctrl.abort(), SMART_QUERY_TIMEOUT_MS)
-  try{
-    const sys = 'Extract 3–6 concrete stock-search terms (nouns/verbs, setting, mood). Return JSON: {"terms":[...]}'
-    const r = await fetch('https://api.openai.com/v1/chat/completions',{
-      method:'POST',
-      headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type':'application/json' },
-      body: JSON.stringify({
-        model: OPENAI_REWRITE_MODEL,
-        messages:[{role:'system',content:sys},{role:'user',content:q}],
-        response_format:{type:'json_object'},
-        temperature:0.2
-      }),
-      signal: ctrl.signal
-    })
-    clearTimeout(to)
-    if (!r.ok) return q
-    const j = await r.json()
-    const parsed = JSON.parse(j.choices[0].message.content||'{}')
-    const terms: string[] = Array.isArray(parsed.terms) ? parsed.terms : []
-    return terms.join(' ') || q
-  } catch { clearTimeout(to); return q }
-}
-
-async function searchVideos(query:string, headers:any){
-  const r = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES*2}`, { headers, cache:'no-store' })
-  if (!r.ok) return []
-  const d = await r.json()
-  const seen = new Set(); const out:Cand[]=[]
-  for (const v of d.videos||[]){
-    if (seen.has(v.id)) continue; seen.add(v.id)
-    const file = pickSd(v); if (!file?.link) continue
-    const fr = framesFrom(v.video_pictures||[], FRAMES)
-    const cover = v.image ? [v.image] : []
-    out.push({ id:v.id, src:file.link, assetType:'video', width:v.width, height:v.height, duration:v.duration||0, frames: fr.length?fr:cover })
-    if (out.length>=MAX_CANDIDATES) break
-  }
-  return out
-}
-
-async function searchPhotos(query:string, headers:any){
-  const r = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES}`, { headers, cache:'no-store' })
-  if (!r.ok) return []
-  const d = await r.json()
-  const out:Cand[] = (d.photos||[])
-    .map((p:any)=>({
-      id:p.id,
-      src: p.src?.original || p.src?.large2x || p.src?.large,
-      assetType:'image' as const,
-      width:p.width, height:p.height, duration:0,
-      frames:[p.src?.medium || p.src?.large || p.src?.original].filter(Boolean)
-    }))
-    .filter((c: Cand) => !!c.src) // <-- typed filter callback
-  return out
 }
 
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.PEXELS_API_KEY) return j({ error:'missing_pexels_key' }, 500)
-    const { segment, outputs, visualQuery, assetPreference, assetMode } = await req.json() as {
-      segment: { start:number; end:number; text:string },
-      outputs?: { portrait?: boolean, landscape?: boolean },
-      visualQuery?: string,
-      assetPreference?: 'video'|'image',
-      assetMode?: 'image_only'|'image_first'|'video_first'
+    const body = await req.json() as {
+      segment: { start:number; end:number; text:string }
+      visualQuery?: string
+      assetPreference?: 'video'|'image'
+      outputs?: { portrait?: boolean, landscape?: boolean }
+      assetMode?: AssetMode
+      excludeIds?: Array<string|number>
     }
+    const { segment, visualQuery, assetPreference, outputs, assetMode='ai' } = body
+    const exclude = new Set((body.excludeIds||[]).map(String))
+
     if (!segment?.text || segment.start==null || segment.end==null) return j({ error:'bad_segment_payload' }, 400)
 
-    const segLen = Math.max(1.5, segment.end - segment.start)
     const want: 'portrait'|'landscape'|'any' =
       outputs?.portrait && !outputs?.landscape ? 'portrait'
       : (!outputs?.portrait && outputs?.landscape) ? 'landscape'
       : 'landscape'
 
+    const segLen = clamp(segment.end - segment.start, 1.8, 7)
     const headers = { Authorization: process.env.PEXELS_API_KEY as string }
 
-    // Effective mode: UI override > env
-    const mode = (assetMode || ASSET_MODE_ENV) as 'image_only'|'image_first'|'video_first'
+    // ---------- candidate search (variety-aware) ----------
+    const q = (visualQuery || segment.text).replace(/\s+/g, ' ').trim().slice(0, 120)
 
-    // Preference: UI > storyboard > env
-    let prefer: 'video'|'image'|null = null
-    if (assetMode) {
-      prefer = mode === 'video_first' ? 'video' : 'image'
-    } else if (assetPreference) {
-      prefer = assetPreference
-    } else {
-      prefer = mode === 'video_first' ? 'video' : (mode === 'image_only' || mode === 'image_first' ? 'image' : null)
+    // small randomization to avoid same first page results
+    const randPage = 1 + Math.floor(Math.random() * 3)
+    const perPage = 30
+
+    let cand: Cand[] = []
+
+    async function searchVideos(query:string) {
+      const r = await fetch(
+        `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=${perPage}&page=${randPage}`,
+        { headers, cache:'no-store' }
+      )
+      if (!r.ok) return []
+      const d = await r.json()
+      const items: Cand[] = (d.videos || []).map((v:any) => {
+        const file = pickSdFile(v)
+        const frames = framesFrom(v.video_pictures||[], FRAMES_PER_CANDIDATE)
+        const cover = v.image ? [v.image] : []
+        return {
+          id: `v_${v.id}`,
+          src: file?.link,
+          assetType: 'video' as const,
+          width: v.width, height: v.height,
+          duration: v.duration || segLen,
+          frames: frames.length ? frames : cover,
+          photographer: v.user?.name
+        }
+      }).filter(x => !!x.src)
+      return items
     }
 
-    const tryPhotosFirst = assetMode
-      ? (mode !== 'video_first')
-      : (assetPreference ? assetPreference==='image' : (ASSET_MODE_ENV !== 'video_first'))
-
-    const baseQ = (visualQuery && visualQuery.trim()) ? visualQuery.trim() : segment.text
-    const q = await rewriteQuery(baseQ)
-
-    let candidates:Cand[] = []
-    if (tryPhotosFirst) {
-      candidates = await searchPhotos(q, headers)
-      if (!candidates.length && mode !== 'image_only') candidates = await searchVideos(q, headers)
-    } else {
-      candidates = await searchVideos(q, headers)
-      if (!candidates.length) candidates = await searchPhotos(q, headers)
+    async function searchPhotos(query:string) {
+      const r = await fetch(
+        `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${perPage}&page=${randPage}`,
+        { headers, cache:'no-store' }
+      )
+      if (!r.ok) return []
+      const d = await r.json()
+      const items: Cand[] = (d.photos || []).map((p:any) => ({
+        id: `p_${p.id}`,
+        src: p.src?.original || p.src?.large2x || p.src?.large,
+        assetType: 'image' as const,
+        width: p.width, height: p.height,
+        duration: segLen,
+        frames: [p.src?.medium || p.src?.large || p.src?.original].filter(Boolean),
+        photographer: p.photographer
+      })).filter(x => !!x.src)
+      return items
     }
 
-    if (!candidates.length) return j({ error:'no_candidates' }, 200)
+    // prefer based on mode / assetPreference
+    const wantVideoFirst =
+      assetMode === 'video_first' ||
+      (assetMode === 'ai' && assetPreference === 'video')
+    const wantImageOnly = assetMode === 'image_only'
 
-    // pick
-    let idx = 0
-    async function pickVision(): Promise<number>{
-      const ctrl = new AbortController()
-      const to = setTimeout(()=>ctrl.abort(), SMART_PICK_TIMEOUT_MS)
+    if (!wantImageOnly && wantVideoFirst) {
+      cand = await searchVideos(q)
+      if (cand.length < MAX_CANDIDATES) cand = cand.concat(await searchPhotos(q))
+    } else if (wantImageOnly) {
+      cand = await searchPhotos(q)
+    } else {
+      // image_first or ai with image preference
+      cand = await searchPhotos(q)
+      if (cand.length < MAX_CANDIDATES) cand = cand.concat(await searchVideos(q))
+    }
+
+    // de-dup & exclude used
+    cand = uniqueBy(cand, c => c.id)
+      .filter(c => !exclude.has(c.id))
+    cand = uniqueBy(cand, c => c.src)
+
+    if (!cand.length) return j({ error:'no_candidates' }, 200)
+
+    // ---------- pick ----------
+    const pickMode: AssetMode = (assetMode === 'ai' && assetPreference)
+      ? (assetPreference === 'video' ? 'video_first' : 'image_first')
+      : assetMode
+
+    // heuristic baseline
+    const ranked = cand
+      .map((c, i) => {
+        let s = baseScore(c, want, pickMode)
+        // small variety bonus for new photographers
+        if (c.photographer) s += 0.5
+        return { i, s }
+      })
+      .sort((a,b)=>b.s-a.s)
+
+    let choiceIdx = ranked[0].i
+
+    // Try SMART_PICK (vision) if enabled
+    if (SMART_PICK && process.env.OPENAI_API_KEY) {
+      const controller = new AbortController()
+      const to = setTimeout(()=>controller.abort(), SMART_PICK_TIMEOUT_MS)
       try {
+        const top = ranked.slice(0, Math.min(MAX_CANDIDATES, 8)).map(x => cand[x.i])
         const content:any[] = [{
           type:'text',
-          text:`Pick the most relevant b-roll for this narration segment: "${segment.text}"
-Query: "${q}"
-Preferred asset: ${prefer || 'none'}; Target aspect: ${want}.
-Rank for: (1) semantic match, (2) clarity/framing, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation.
-Return JSON: {"best_index": <0-based>}.`
+          text:`Pick the best b-roll for:\n"${q}"\nAspect priority: ${want}. Prefer variety from previous picks (avoid duplicates).\nReturn {"best_index":<0-based>}.`
         }]
-        candidates.forEach((c,i)=>{
-          content.push({ type:'text', text:`Candidate ${i} – ${c.assetType.toUpperCase()} • ${(c.duration||0).toFixed(1)}s` })
-          ;(c.frames||[]).slice(0,1).forEach(u=> content.push({ type:'image_url', image_url:{ url:u } }))
+        top.forEach((c,i)=>{
+          content.push({ type:'text', text:`Candidate ${i} – ${c.assetType} ${c.width}x${c.height}` })
+          ;(c.frames||[]).slice(0,FRAMES_PER_CANDIDATE).forEach(u=>{
+            content.push({ type:'image_url', image_url:{ url:u } })
+          })
         })
-        const r = await fetch('https://api.openai.com/v1/chat/completions',{
+        const resp = await fetch('https://api.openai.com/v1/chat/completions',{
           method:'POST',
           headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type':'application/json' },
-          body: JSON.stringify({ model: OPENAI_VISION_MODEL, messages:[{role:'user',content}], response_format:{type:'json_object'} }),
-          signal: ctrl.signal
+          body: JSON.stringify({
+            model: OPENAI_MODEL,
+            messages: [{ role:'user', content }],
+            response_format: { type:'json_object' },
+            temperature: 0
+          }),
+          signal: controller.signal
         })
         clearTimeout(to)
-        if (!r.ok) return 0
-        const j = await r.json()
-        const p = JSON.parse(j.choices[0].message.content || '{}')
-        return Number.isInteger(p.best_index) ? clamp(p.best_index, 0, candidates.length-1) : 0
-      } catch { clearTimeout(to); return 0 }
+        if (resp.ok) {
+          const json = await resp.json()
+          const parsed = JSON.parse(json.choices[0].message.content)
+          const best = Number(parsed?.best_index)
+          if (Number.isInteger(best) && best>=0 && best<top.length) {
+            choiceIdx = cand.indexOf(top[best])
+          }
+        }
+      } catch { /* fall back to heuristic */ }
     }
 
-    if (SMART_PICK && process.env.OPENAI_API_KEY) {
-      idx = await pickVision()
-      if (idx === 0) {
-        idx = candidates.map((c,i)=>({i, s: score(c, want, segLen, prefer)})).sort((a,b)=>b.s-a.s)[0]?.i ?? 0
-      }
-    } else {
-      idx = candidates.map((c,i)=>({i, s: score(c, want, segLen, prefer)})).sort((a,b)=>b.s-a.s)[0]?.i ?? 0
+    // final guard: if selection somehow in exclude list (racey), move to next
+    if (exclude.has(cand[choiceIdx].id)) {
+      const fallback = ranked.find(r => !exclude.has(cand[r.i].id))
+      if (fallback) choiceIdx = fallback.i
     }
 
-    let chosen = candidates[idx]
+    const chosen = cand[choiceIdx]
+    const length = clamp(segLen, 1.8, chosen.duration || segLen)
 
-    // Strict coverage: if video too short, swap to an image
-    if (STRICT_COVERAGE && chosen.assetType==='video' && (chosen.duration||0) < segLen-0.05) {
-      const photos = await searchPhotos(q, headers)
-      if (photos.length) chosen = photos[0]
-    }
-
-    return j({ clip: { src: chosen.src, start: segment.start, length: segLen, assetType: chosen.assetType } })
+    return j({
+      clip: { src: chosen.src, start: segment.start, length, assetType: chosen.assetType },
+      pickedId: chosen.id
+    })
   } catch (e:any) {
     return j({ error:'server_error', message: e?.message || String(e) }, 500)
   }

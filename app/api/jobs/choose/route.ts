@@ -5,15 +5,11 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 const j = (o: any, s = 200) => NextResponse.json(o, { status: s })
 
-// ---- config ----
 const MAX_CANDIDATES = 6
 const FRAMES_PER_CANDIDATE = 2
+const SMART_PICK = process.env.SMART_PICK === '1'
+const SMART_QUERY = process.env.SMART_QUERY === '1'
 
-// toggles
-const SMART_PICK = process.env.SMART_PICK === '1'              // GPT-vision re-ranking
-const SMART_QUERY = process.env.SMART_QUERY === '1'            // LLM query rewriter (text-only)
-
-// models/timeouts
 const OPENAI_VISION_MODEL =
   process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-5-mini'
 const OPENAI_REWRITE_MODEL =
@@ -22,7 +18,6 @@ const OPENAI_REWRITE_MODEL =
 const SMART_PICK_TIMEOUT_MS = Number(process.env.SMART_PICK_TIMEOUT_MS || 15000)
 const SMART_QUERY_TIMEOUT_MS = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
 
-// ---- helpers ----
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n))
 const pickSdFile = (v: any) =>
   (v?.video_files || []).find((f: any) => f.quality === 'sd') ?? (v?.video_files || [])[0]
@@ -65,7 +60,7 @@ function scoreCandidate(c: Cand, want: 'portrait' | 'landscape' | 'any') {
   return s
 }
 
-// --- SMART_QUERY: rewrite a raw segment into concise visual terms
+// SMART_QUERY: rewrite segment → concise visual search
 async function rewriteQuery(raw: string, want: 'portrait' | 'landscape' | 'any'): Promise<string> {
   if (!SMART_QUERY || !process.env.OPENAI_API_KEY) return raw
   const controller = new AbortController()
@@ -85,8 +80,7 @@ async function rewriteQuery(raw: string, want: 'portrait' | 'landscape' | 'any')
       body: JSON.stringify({
         model: OPENAI_REWRITE_MODEL,
         messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
-        response_format: { type: 'json_object' },
-        temperature: 0.2
+        response_format: { type: 'json_object' }
       }),
       signal: controller.signal
     })
@@ -103,7 +97,6 @@ async function rewriteQuery(raw: string, want: 'portrait' | 'landscape' | 'any')
   }
 }
 
-// ---- main ----
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.PEXELS_API_KEY) return j({ error: 'missing_pexels_key' }, 500)
@@ -124,16 +117,13 @@ export async function POST(req: NextRequest) {
 
     const headers = { Authorization: process.env.PEXELS_API_KEY as string }
 
-    // --- build search query (optionally via SMART_QUERY) ---
     const baseQuery = await rewriteQuery(segment.text, want)
 
-    // 1) videos first
+    // videos first
     let candidates: Cand[] = []
     try {
       const vr = await fetch(
-        `https://api.pexels.com/videos/search?query=${encodeURIComponent(baseQuery)}&per_page=${
-          MAX_CANDIDATES * 2
-        }`,
+        `https://api.pexels.com/videos/search?query=${encodeURIComponent(baseQuery)}&per_page=${MAX_CANDIDATES * 2}`,
         { headers, cache: 'no-store' }
       )
       if (vr.ok) {
@@ -162,11 +152,9 @@ export async function POST(req: NextRequest) {
           })
           .filter((c: Cand) => !!c.src)
       }
-    } catch {
-      /* ignore */
-    }
+    } catch {}
 
-    // 2) fallback to photos (with orientation hint)
+    // fallback to photos
     if (!candidates.length) {
       try {
         const orientationParam =
@@ -190,37 +178,28 @@ export async function POST(req: NextRequest) {
             }))
             .filter((c: Cand) => !!c.src)
         }
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     }
 
     if (!candidates.length) return j({ error: 'no_candidates' }, 200)
 
-    // 3) pick: either SMART (vision) or heuristic
+    // pick: SMART (vision) or heuristic
     let chosenIdx = 0
 
     async function pickWithVision(): Promise<number> {
       const controller = new AbortController()
       const to = setTimeout(() => controller.abort(), SMART_PICK_TIMEOUT_MS)
       try {
-        const content: any[] = [
-          {
-            type: 'text',
-            text:
-              `Pick the best b-roll for this narration segment:\n"${segment.text}"\n` +
-              `Target aspect: ${want}. Score for: (1) semantic relevance, (2) framing clarity, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation suitability.\n` +
-              `Return strict JSON: {"best_index": <0-based>, "reason": "<short>"}.`
-          }
-        ]
+        const content: any[] = [{
+          type: 'text',
+          text:
+            `Pick the best b-roll for this narration segment:\n"${segment.text}"\n` +
+            `Target aspect: ${want}. Score for: (1) semantic relevance, (2) framing clarity, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation suitability.\n` +
+            `Return strict JSON: {"best_index": <0-based>, "reason": "<short>"}.`
+        }]
         candidates.forEach((c, i) => {
           const orient = orientationOf(c.width, c.height)
-          content.push({
-            type: 'text',
-            text: `Candidate ${i} – ${c.assetType.toUpperCase()} · ${orient} · ~${(
-              c.duration || segLen
-            ).toFixed(1)}s`
-          })
+          content.push({ type: 'text', text: `Candidate ${i} – ${c.assetType.toUpperCase()} · ${orient} · ~${(c.duration || segLen).toFixed(1)}s` })
           ;(c.frames || []).slice(0, FRAMES_PER_CANDIDATE).forEach((u) =>
             content.push({ type: 'image_url', image_url: { url: u } })
           )
@@ -228,16 +207,11 @@ export async function POST(req: NextRequest) {
 
         const pickRes = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
+          headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: OPENAI_VISION_MODEL,
             messages: [{ role: 'user', content }],
-            response_format: { type: 'json_object' },
-            reasoning_effort: 'low',
-            temperature: 0
+            response_format: { type: 'json_object' }
           }),
           signal: controller.signal
         })
@@ -257,18 +231,13 @@ export async function POST(req: NextRequest) {
     if (SMART_PICK && process.env.OPENAI_API_KEY) {
       chosenIdx = await pickWithVision()
       if (chosenIdx === 0) {
-        // re-score heuristically in case vision timed out or tied
-        const idx =
-          candidates
-            .map((c, i) => ({ i, s: scoreCandidate(c, want) }))
-            .sort((a, b) => b.s - a.s)[0]?.i ?? 0
+        const idx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want) }))
+          .sort((a, b) => b.s - a.s)[0]?.i ?? 0
         chosenIdx = idx
       }
     } else {
-      chosenIdx =
-        candidates
-          .map((c, i) => ({ i, s: scoreCandidate(c, want) }))
-          .sort((a, b) => b.s - a.s)[0]?.i ?? 0
+      chosenIdx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want) }))
+        .sort((a, b) => b.s - a.s)[0]?.i ?? 0
     }
 
     const chosen = candidates[chosenIdx]

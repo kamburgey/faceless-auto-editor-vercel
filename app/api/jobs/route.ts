@@ -1,12 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { put } from '@vercel/blob'
 
+export const runtime = 'nodejs'
+export const maxDuration = 60  // allow up to 60s on Pro; Hobby will cap lower
+
 export const dynamic = 'force-dynamic'
 const j = (o: any, s = 200) => NextResponse.json(o, { status: s })
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5'
-const MAX_CANDIDATES_PER_SEGMENT = 5
-const FRAMES_PER_CANDIDATE = 2
+const MAX_CANDIDATES_PER_SEGMENT = 2
+const FRAMES_PER_CANDIDATE = 1
 
 type Segment = { start: number; end: number; text: string }
 type ClipPick = { src: string; start: number; length: number; assetType: 'video' | 'image' }

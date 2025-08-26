@@ -1,40 +1,40 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-export const runtime='nodejs'
-export const dynamic='force-dynamic'
-export const maxDuration=60
-const j=(o:any,s=200)=>NextResponse.json(o,{status:s})
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+const j = (o:any, s=200) => NextResponse.json(o, { status: s })
 
-type Clip = { src:string; start:number; length:number; assetType:'video'|'image' }
+type ClipIn = { src:string; start:number; length:number; assetType:'video'|'image' }
 
-function makeTimeline(audioUrl:string, clips:Clip[], aspectRatio:'9:16'|'16:9'){
+function timelineFor(aspect:'9:16'|'16:9', clips: ClipIn[], audioUrl:string) {
   return {
     timeline: {
       background: '#000000',
-      soundtrack: { src: audioUrl, volume: 1 }, // no fadeOut
+      soundtrack: { src: audioUrl, effect: 'none' }, // no fade
       tracks: [
         {
           clips: clips.map(c => ({
-            asset: {
-              type: c.assetType === 'image' ? 'image' : 'video',
-              src: c.src,
-              ...(c.assetType === 'video' ? { volume: 0, trim: 0 } : {}) // hard trim from 0
-            },
+            asset:
+              c.assetType === 'image'
+                ? { type:'image', src:c.src }
+                : { type:'video', src:c.src, volume:0 }, // mute native audio
             start: c.start,
             length: c.length,
-            fit: 'cover'
+            fit: 'cover',
+            position: 'center'
           }))
         }
+        // captions track deliberately omitted (we still upload SRT separately if you want it later)
       ]
     },
-    output: { format: 'mp4', resolution: 'hd', aspectRatio }
+    output: { format: 'mp4', resolution: 'hd', aspectRatio: aspect }
   }
 }
 
-async function renderShotstack(tl:any){
+async function renderWithShotstack(tl:any, key:string) {
   const r = await fetch('https://api.shotstack.io/stage/render', {
     method:'POST',
-    headers:{ 'x-api-key': process.env.SHOTSTACK_API_KEY!, 'Content-Type':'application/json' },
+    headers:{ 'x-api-key': key, 'Content-Type':'application/json' },
     body: JSON.stringify(tl)
   })
   const j = await r.json()
@@ -44,17 +44,25 @@ async function renderShotstack(tl:any){
 export async function POST(req: NextRequest) {
   try {
     const { clips, audioUrl, outputs } = await req.json() as {
-      clips: Clip[], audioUrl: string, outputs?: { portrait?: boolean; landscape?: boolean }
+      clips: ClipIn[],
+      audioUrl: string,
+      outputs: { portrait?: boolean, landscape?: boolean }
     }
-    if (!clips?.length) return j({error:'no_clips'},400)
-    if (!audioUrl) return j({error:'missing_audioUrl'},400)
+    if (!Array.isArray(clips) || !clips.length) return j({ error:'no_clips' }, 400)
+    if (!audioUrl) return j({ error:'no_audio' }, 400)
+    if (!process.env.SHOTSTACK_API_KEY) return j({ error:'missing_shotstack_key' }, 500)
 
     const jobs: { portrait?: string; landscape?: string } = {}
-    if (outputs?.portrait) jobs.portrait = await renderShotstack(makeTimeline(audioUrl, clips, '9:16'))
-    if (outputs?.landscape) jobs.landscape = await renderShotstack(makeTimeline(audioUrl, clips, '16:9'))
-
+    if (outputs?.portrait) {
+      const tl = timelineFor('9:16', clips, audioUrl)
+      jobs.portrait = await renderWithShotstack(tl, process.env.SHOTSTACK_API_KEY!)
+    }
+    if (outputs?.landscape) {
+      const tl = timelineFor('16:9', clips, audioUrl)
+      jobs.landscape = await renderWithShotstack(tl, process.env.SHOTSTACK_API_KEY!)
+    }
     return j({ jobs })
   } catch (e:any) {
-    return j({error:'server_error', message:e?.message || String(e)},500)
+    return j({ error:'server_error', message:e?.message || String(e) }, 500)
   }
 }

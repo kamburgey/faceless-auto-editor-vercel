@@ -3,244 +3,186 @@ import { NextRequest, NextResponse } from 'next/server'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
-const j = (o: any, s = 200) => NextResponse.json(o, { status: s })
+const j = (o:any, s=200) => NextResponse.json(o, { status: s })
 
-// ---- config ----
+// config
 const MAX_CANDIDATES = 6
-const FRAMES_PER_CANDIDATE = 2
-
-const SMART_PICK  = process.env.SMART_PICK === '1'         // GPT-vision re-rank
-const SMART_QUERY = process.env.SMART_QUERY === '1'        // LLM query rewrite
-
+const FRAMES = 1
+const SMART_PICK  = process.env.SMART_PICK === '1'
+const SMART_QUERY = process.env.SMART_QUERY === '1'
 const OPENAI_VISION_MODEL  = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'
 const OPENAI_REWRITE_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+const SMART_PICK_TIMEOUT_MS  = Number(process.env.SMART_PICK_TIMEOUT_MS  || 15000)
+const SMART_QUERY_TIMEOUT_MS = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
+const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0'
+const ASSET_MODE = (process.env.ASSET_MODE || 'image_first').toLowerCase() // 'image_only' | 'image_first' | 'video_first'
 
-const SMART_PICK_TIMEOUT_MS   = Number(process.env.SMART_PICK_TIMEOUT_MS  || 15000)
-const SMART_QUERY_TIMEOUT_MS  = Number(process.env.SMART_QUERY_TIMEOUT_MS || 1500)
-
-// strict coverage: ensure every beat is visually covered fully
-const STRICT_COVERAGE = process.env.STRICT_COVERAGE !== '0' // default ON
-
-// emergency fallbacks if main query returns nothing
-const EMERGENCY_QUERIES = [
-  'abstract gradient background',
-  'soft bokeh lights background',
-  'minimal texture background',
-  'dark gradient backdrop'
-]
-
+type Cand = { id:string|number; src:string; assetType:'video'|'image'; width?:number; height?:number; duration?:number; frames?:string[] }
 const clamp = (n:number,min:number,max:number)=>Math.max(min,Math.min(max,n))
-const pickSdFile = (v:any)=> (v?.video_files||[]).find((f:any)=>f.quality==='sd') ?? (v?.video_files||[])[0]
-const framesFrom = (pics:any[], count:number)=>{
-  if (!Array.isArray(pics) || !pics.length) return []
-  if (pics.length<=count) return pics.map((p:any)=>p.picture)
-  const step=Math.max(1,Math.floor(pics.length/count))
-  const out:string[]=[]; for(let i=0;i<pics.length && out.length<count;i+=step) out.push(pics[i].picture)
-  return out
-}
-function orientationOf(w?:number,h?:number){
-  if (!w || !h) return 'unknown'
-  if (w > h) return 'landscape'
-  if (h > w) return 'portrait'
-  return 'square'
-}
-type Cand = {
-  id: number|string
-  src: string
-  assetType: 'video'|'image'
-  width?: number
-  height?: number
-  duration?: number
-  frames?: string[]
-}
-function scoreCandidate(c: Cand, want: 'portrait'|'landscape'|'any', segLen:number){
+const pickSd = (v:any)=> (v?.video_files||[]).find((f:any)=>f.quality==='sd') ?? (v?.video_files||[])[0]
+const framesFrom = (pics:any[], k:number)=>!Array.isArray(pics)||!pics.length?[]:pics.slice(0, k).map((p:any)=>p.picture)
+const orient = (w?:number,h?:number)=>!w||!h?'unknown':(w>h?'landscape':(h>w?'portrait':'square'))
+
+function score(c:Cand, want:'portrait'|'landscape'|'any', segLen:number, prefer:'video'|'image'|null){
   let s = 0
-  const o = orientationOf(c.width, c.height)
-  if (want !== 'any') {
-    if (o === want) s += 3
-    else if (o === 'square' || o === 'unknown') s += 1
-  } else s += 1
-  if (c.assetType === 'video') {
+  const o = orient(c.width, c.height)
+  if (want!=='any') s += (o===want?3:(o==='square'||o==='unknown'?1:0)); else s+=1
+  if (prefer && c.assetType===prefer) s += 3
+  if (c.assetType==='video') {
     s += 2
-    // penalize videos that can't cover most of the beat
-    if ((c.duration || 0) < segLen * 0.85) s -= 3
+    if ((c.duration||0) < segLen*0.85) s -= 3
   }
   if (c.src) s += 1
   return s
 }
 
-// SMART_QUERY rewrite
-async function rewriteQuery(raw: string, want: 'portrait'|'landscape'|'any'): Promise<string> {
-  if (!SMART_QUERY || !process.env.OPENAI_API_KEY) return raw
-  const controller = new AbortController()
-  const to = setTimeout(()=>controller.abort(), SMART_QUERY_TIMEOUT_MS)
-  try {
-    const sys = 'Extract 3–6 concrete visual stock-search terms (objects, actions, setting, mood). Return JSON: {"terms":[...]}'
-    const user = `Line: "${raw}"  Orientation: ${want}. Avoid abstract words; prefer concrete visuals.`
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+async function rewriteQuery(q:string){
+  if (!SMART_QUERY || !process.env.OPENAI_API_KEY) return q
+  const ctrl = new AbortController()
+  const to = setTimeout(()=>ctrl.abort(), SMART_QUERY_TIMEOUT_MS)
+  try{
+    const sys = 'Extract 3–6 concrete stock-search terms (nouns/verbs, setting, mood). Return JSON: {"terms":[...]}'
+    const r = await fetch('https://api.openai.com/v1/chat/completions',{
+      method:'POST',
+      headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type':'application/json' },
       body: JSON.stringify({
         model: OPENAI_REWRITE_MODEL,
-        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
-        response_format: { type: 'json_object' }
+        messages:[{role:'system',content:sys},{role:'user',content:q}],
+        response_format:{type:'json_object'},
+        temperature:0.2
       }),
-      signal: controller.signal
+      signal: ctrl.signal
     })
     clearTimeout(to)
-    if (!r.ok) return raw
+    if (!r.ok) return q
     const j = await r.json()
-    const parsed = JSON.parse(j.choices[0].message.content || '{}')
+    const parsed = JSON.parse(j.choices[0].message.content||'{}')
     const terms: string[] = Array.isArray(parsed.terms) ? parsed.terms : []
-    const q = terms.join(' ').trim()
-    return q || raw
-  } catch {
-    clearTimeout(to)
-    return raw
+    return terms.join(' ') || q
+  } catch { clearTimeout(to); return q }
+}
+
+async function searchVideos(query:string, headers:any){
+  const r = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES*2}`, { headers, cache:'no-store' })
+  if (!r.ok) return []
+  const d = await r.json()
+  const seen = new Set(); const out:Cand[]=[]
+  for (const v of d.videos||[]){
+    if (seen.has(v.id)) continue; seen.add(v.id)
+    const file = pickSd(v); if (!file?.link) continue
+    const fr = framesFrom(v.video_pictures||[], FRAMES)
+    const cover = v.image ? [v.image] : []
+    out.push({ id:v.id, src:file.link, assetType:'video', width:v.width, height:v.height, duration:v.duration||0, frames: fr.length?fr:cover })
+    if (out.length>=MAX_CANDIDATES) break
   }
+  return out
 }
-
 async function searchPhotos(query:string, headers:any){
-  const pr = await fetch(
-    `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES}`,
-    { headers, cache:'no-store' }
-  )
-  if (!pr.ok) return []
-  const pd = await pr.json()
-  return (pd.photos || []).map((p:any)=>({
-    id:p.id,
-    src: p.src?.original || p.src?.large2x || p.src?.large,
-    assetType:'image' as const,
-    width:p.width, height:p.height
-  })).filter((c:Cand)=>!!c.src)
+  const r = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${MAX_CANDIDATES}`, { headers, cache:'no-store' })
+  if (!r.ok) return []
+  const d = await r.json()
+  const out:Cand[] = (d.photos||[]).map((p:any)=>({
+    id:p.id, src:p.src?.original||p.src?.large2x||p.src?.large, assetType:'image',
+    width:p.width, height:p.height, duration:0, frames:[p.src?.medium||p.src?.large||p.src?.original].filter(Boolean)
+  })).filter(c=>!!c.src)
+  return out
 }
 
-// ---- main ----
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.PEXELS_API_KEY) return j({ error:'missing_pexels_key' }, 500)
-    const { segment, outputs } = await req.json() as {
+    const { segment, outputs, visualQuery, assetPreference } = await req.json() as {
       segment: { start:number; end:number; text:string },
-      outputs?: { portrait?: boolean, landscape?: boolean }
+      outputs?: { portrait?: boolean, landscape?: boolean },
+      visualQuery?: string,
+      assetPreference?: 'video'|'image'
     }
     if (!segment?.text || segment.start==null || segment.end==null) return j({ error:'bad_segment_payload' }, 400)
 
-    // ✅ use the exact beat length — no upper clamp
-    const segLen = Math.max(1.5, (segment.end - segment.start))
-
+    const segLen = Math.max(1.5, segment.end - segment.start)
     const want: 'portrait'|'landscape'|'any' =
       outputs?.portrait && !outputs?.landscape ? 'portrait'
       : (!outputs?.portrait && outputs?.landscape) ? 'landscape'
-      : 'landscape' // both -> lean landscape
+      : 'landscape'
 
     const headers = { Authorization: process.env.PEXELS_API_KEY as string }
 
-    const baseQuery = await rewriteQuery(segment.text, want)
+    const baseQ = (visualQuery && visualQuery.trim()) ? visualQuery.trim() : segment.text
+    const q = await rewriteQuery(baseQ)
 
-    // 1) videos first
-    let candidates: Cand[] = []
-    try {
-      const vr = await fetch(
-        `https://api.pexels.com/videos/search?query=${encodeURIComponent(baseQuery)}&per_page=${MAX_CANDIDATES*2}`,
-        { headers, cache:'no-store' }
-      )
-      if (vr.ok) {
-        const vd = await vr.json()
-        const uniq:any[] = []; const seen = new Set()
-        for (const v of vd.videos || []) { if (seen.has(v.id)) continue; seen.add(v.id); uniq.push(v) }
-        candidates = uniq.slice(0, MAX_CANDIDATES).map((v:any) => {
-          const file = pickSdFile(v)
-          const frames = framesFrom(v.video_pictures||[], FRAMES_PER_CANDIDATE)
-          const cover = v.image ? [v.image] : []
-          return {
-            id:v.id, src:file?.link, assetType:'video' as const,
-            width:v.width, height:v.height,
-            duration:v.duration || 0,
-            frames: frames.length ? frames : cover
-          }
-        }).filter((c:Cand)=>!!c.src)
-      }
-    } catch {}
+    const prefer: 'video'|'image'|null =
+      assetPreference ? assetPreference :
+      ASSET_MODE==='image_only' ? 'image' :
+      ASSET_MODE==='image_first' ? 'image' :
+      ASSET_MODE==='video_first' ? 'video' : null
 
-    // 2) fallback to photos if no videos
-    if (!candidates.length) {
-      for (const q of [baseQuery, ...EMERGENCY_QUERIES]) {
-        const photos = await searchPhotos(q, headers)
-        if (photos.length) { candidates = photos; break }
-      }
+    // decide search order
+    const tryPhotosFirst = ASSET_MODE==='image_only' || ASSET_MODE==='image_first' || prefer==='image'
+
+    let candidates:Cand[] = []
+
+    if (tryPhotosFirst) {
+      candidates = await searchPhotos(q, headers)
+      if (!candidates.length && ASSET_MODE!=='image_only') candidates = await searchVideos(q, headers)
+    } else {
+      candidates = await searchVideos(q, headers)
+      if (!candidates.length) candidates = await searchPhotos(q, headers)
     }
 
-    if (!candidates.length) {
-      // last-last resort: return a dummy black frame via a known-good Pexels query
-      return j({ clip: { src: 'https://images.pexels.com/photos/35600/road-sun-rays-path.jpg', start: segment.start, length: segLen, assetType: 'image' } })
-    }
+    if (!candidates.length) return j({ error:'no_candidates' }, 200)
 
-    // 3) pick: SMART (vision) or heuristic
-    let chosenIdx = 0
-
-    async function pickWithVision(): Promise<number> {
-      const controller = new AbortController()
-      const to = setTimeout(()=>controller.abort(), SMART_PICK_TIMEOUT_MS)
+    // pick best
+    let idx = 0
+    async function pickVision(): Promise<number>{
+      const ctrl = new AbortController()
+      const to = setTimeout(()=>ctrl.abort(), SMART_PICK_TIMEOUT_MS)
       try {
         const content:any[] = [{
           type:'text',
-          text:`Pick the best b-roll for this narration segment:\n"${segment.text}"
-Target aspect: ${want}. Score for: (1) semantic relevance, (2) framing clarity, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation suitability.
-Return strict JSON: {"best_index": <0-based>, "reason": "<short>"}.`
+          text:`Pick the most relevant b-roll for this narration segment: "${segment.text}"
+Query: "${q}"
+Preferred asset: ${prefer || 'none'}; Target aspect: ${want}.
+Rank for: (1) semantic match, (2) clarity/framing, (3) motion/energy fit, (4) safety/brand-friendly, (5) orientation. 
+Return JSON: {"best_index": <0-based>}.`
         }]
         candidates.forEach((c,i)=>{
-          const orient = orientationOf(c.width, c.height)
-          content.push({ type:'text', text:`Candidate ${i} – ${c.assetType.toUpperCase()} · ${orient} · ${(c.duration||0).toFixed(1)}s` })
-          ;(c.frames||[]).slice(0, FRAMES_PER_CANDIDATE).forEach(u=> content.push({ type:'image_url', image_url:{ url:u } }))
+          content.push({ type:'text', text:`Candidate ${i} – ${c.assetType.toUpperCase()} • ${(c.duration||0).toFixed(1)}s` })
+          ;(c.frames||[]).slice(0,1).forEach(u=> content.push({ type:'image_url', image_url:{ url:u } }))
         })
-
-        const pickRes = await fetch('https://api.openai.com/v1/chat/completions',{
+        const r = await fetch('https://api.openai.com/v1/chat/completions',{
           method:'POST',
           headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type':'application/json' },
-          body: JSON.stringify({
-            model: OPENAI_VISION_MODEL,
-            messages: [{ role:'user', content }],
-            response_format: { type:'json_object' }
-          }),
-          signal: controller.signal
+          body: JSON.stringify({ model: OPENAI_VISION_MODEL, messages:[{role:'user',content}], response_format:{type:'json_object'} }),
+          signal: ctrl.signal
         })
         clearTimeout(to)
-        if (!pickRes.ok) throw new Error(await pickRes.text())
-        const pr = await pickRes.json()
-        const parsed = JSON.parse(pr.choices[0].message.content)
-        if (Number.isInteger(parsed.best_index)) return clamp(parsed.best_index, 0, candidates.length-1)
-        return 0
-      } catch {
-        clearTimeout(to)
-        return 0
-      }
+        if (!r.ok) return 0
+        const j = await r.json()
+        const p = JSON.parse(j.choices[0].message.content || '{}')
+        return Number.isInteger(p.best_index) ? clamp(p.best_index, 0, candidates.length-1) : 0
+      } catch { clearTimeout(to); return 0 }
     }
 
     if (SMART_PICK && process.env.OPENAI_API_KEY) {
-      chosenIdx = await pickWithVision()
-      if (chosenIdx === 0) {
-        const idx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want, segLen) }))
-          .sort((a,b)=>b.s-a.s)[0]?.i ?? 0
-        chosenIdx = idx
+      idx = await pickVision()
+      if (idx === 0) {
+        idx = candidates.map((c,i)=>({i, s: score(c, want, segLen, prefer)})).sort((a,b)=>b.s-a.s)[0]?.i ?? 0
       }
     } else {
-      chosenIdx = candidates.map((c, i) => ({ i, s: scoreCandidate(c, want, segLen) }))
-        .sort((a,b)=>b.s-a.s)[0]?.i ?? 0
+      idx = candidates.map((c,i)=>({i, s: score(c, want, segLen, prefer)})).sort((a,b)=>b.s-a.s)[0]?.i ?? 0
     }
 
-    let chosen = candidates[chosenIdx]
+    let chosen = candidates[idx]
 
-    // ---- STRICT COVERAGE: if chosen video is shorter than the beat, auto-swap to a photo of same query ----
-    if (STRICT_COVERAGE && chosen.assetType === 'video' && (chosen.duration || 0) < segLen - 0.05) {
-      for (const q of [baseQuery, ...EMERGENCY_QUERIES]) {
-        const photos = await searchPhotos(q, headers)
-        if (photos.length) { chosen = photos[0]; break }
-      }
+    // Strict coverage: if video too short for this beat, swap to an image
+    if (STRICT_COVERAGE && chosen.assetType==='video' && (chosen.duration||0) < segLen-0.05) {
+      const photos = await searchPhotos(q, headers)
+      if (photos.length) chosen = photos[0]
     }
 
-    // Always return the full beat length so visuals fully cover the VO
+    // Cover the full beat length; video will be trimmed to segLen during render
     return j({ clip: { src: chosen.src, start: segment.start, length: segLen, assetType: chosen.assetType } })
   } catch (e:any) {
-    return j({ error:'server_error', message: e?.message || String(e) }, 500)
+    return j({ error:'server_error', message:e?.message || String(e) }, 500)
   }
 }

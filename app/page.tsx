@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react'
 
 type Jobs = { portrait?: string; landscape?: string }
-type Segment = { start: number; end: number; text: string }
+type Segment = { start: number; end: number; text: string; visualQuery?: string; assetPreference?: 'video'|'image' }
 type Clip = { src: string; start: number; length: number; assetType: 'video' | 'image' }
 
 export default function Home() {
@@ -11,6 +11,7 @@ export default function Home() {
   const [niche, setNiche] = useState('food & drink')
   const [tone, setTone] = useState('informative, upbeat')
   const [dur, setDur] = useState<number>(25)
+  const [assetMode, setAssetMode] = useState<'image_only'|'image_first'|'video_first'>('image_first') // NEW
   const [usePortrait, setUsePortrait] = useState(true)
   const [useLandscape, setUseLandscape] = useState(true)
 
@@ -19,7 +20,7 @@ export default function Home() {
   const [progress, setProgress] = useState<string[]>([])
   const [narration, setNarration] = useState<string | null>(null)
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
-  const [captionsUrl, setCaptionsUrl] = useState<string | null>(null) // <-- ensure this exists
+  const [captionsUrl, setCaptionsUrl] = useState<string | null>(null)
   const [segments, setSegments] = useState<Segment[] | null>(null)
   const [clips, setClips] = useState<Clip[] | null>(null)
 
@@ -30,8 +31,13 @@ export default function Home() {
   const [urlP, setUrlP] = useState<string | null>(null)
   const [urlL, setUrlL] = useState<string | null>(null)
 
-  function pushProgress(line: string) {
-    setProgress(prev => [...prev, line])
+  const pushProgress = (line: string) => setProgress(prev => [...prev, line])
+
+  const safeJson = async (res: Response) => {
+    const ct = res.headers.get('content-type') || ''
+    if (ct.includes('application/json')) return res.json()
+    const txt = await res.text()
+    throw new Error(txt.slice(0, 200))
   }
 
   async function startJob(e: React.FormEvent) {
@@ -42,7 +48,7 @@ export default function Home() {
       return
     }
 
-    // reset UI
+    // reset
     setRunning(true)
     setProgress([])
     setNarration(null); setAudioUrl(null); setCaptionsUrl(null)
@@ -58,11 +64,11 @@ export default function Home() {
         body: JSON.stringify({ topic, niche, tone, targetDurationSec: Number(dur) })
       })
       if (!s1.ok) throw new Error(await s1.text())
-      const d1 = await s1.json()
+      const d1 = await safeJson(s1)
       setNarration(d1.narration || null)
       setAudioUrl(d1.audioUrl || null)
 
-      // 2) STT (segments + words)
+      // 2) STT
       pushProgress('2/4 Transcribing (segments + words)…')
       const s2 = await fetch('/api/jobs/stt', {
         method: 'POST',
@@ -70,27 +76,28 @@ export default function Home() {
         body: JSON.stringify({ audioUrl: d1.audioUrl })
       })
       if (!s2.ok) throw new Error(await s2.text())
-      const d2 = await s2.json()
+      const d2 = await safeJson(s2)
       setCaptionsUrl(d2.captionsUrl || null)
 
-      // 2.5) LLM scene beats (re-segmentation using timings)
-      pushProgress('2.5/4 Finding smart scene beats…')
-      const s25 = await fetch('/api/jobs/resegment', {
+      // 2.5) Storyboard (sentence-aligned + visual queries)
+      pushProgress('2.5/4 Planning visuals per sentence…')
+      const s25 = await fetch('/api/jobs/plan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           transcript: d2.transcript,
-          segments: d2.segments,
           words: d2.words,
+          niche,
+          tone,
           targetDurationSec: Number(dur)
         })
       })
       if (!s25.ok) throw new Error(await s25.text())
-      const d25 = await s25.json()
-      const beats: Segment[] = d25.beats || d2.segments
+      const d25 = await safeJson(s25)
+      const beats: Segment[] = d25.beats
       setSegments(beats)
 
-      // 3) choose clips per beat
+      // 3) choose clips per beat (pass visualQuery, assetPreference, and UI assetMode)
       pushProgress(`3/4 Selecting b-roll… (0/${beats.length})`)
       const chosen: Clip[] = []
       for (let i = 0; i < beats.length; i++) {
@@ -98,10 +105,16 @@ export default function Home() {
           const r = await fetch('/api/jobs/choose', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ segment: beats[i], outputs: { portrait: usePortrait, landscape: useLandscape } })
+            body: JSON.stringify({
+              segment: beats[i],
+              visualQuery: beats[i].visualQuery,
+              assetPreference: beats[i].assetPreference,
+              assetMode, // <-- UI override goes to server
+              outputs: { portrait: usePortrait, landscape: useLandscape }
+            })
           })
           if (!r.ok) throw new Error(await r.text())
-          const jr = await r.json()
+          const jr = await safeJson(r)
           if (jr?.clip) chosen.push(jr.clip)
         } catch (err: any) {
           pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0,120) || String(err)}`)
@@ -119,12 +132,12 @@ export default function Home() {
         body: JSON.stringify({
           clips: chosen,
           audioUrl: d1.audioUrl,
-          captionsUrl: d2.captionsUrl,
+          captionsUrl: d2.captionsUrl, // still uploaded by STT route even if not burned-in
           outputs: { portrait: usePortrait, landscape: useLandscape }
         })
       })
       if (!r.ok) throw new Error(await r.text())
-      const d3 = await r.json()
+      const d3 = await safeJson(r)
       setJobs(d3.jobs || {})
       pushProgress('Queued. Polling render status…')
     } catch (err: any) {
@@ -169,13 +182,22 @@ export default function Home() {
 
   return (
     <main style={{ maxWidth: 760, margin: '2rem auto', fontFamily: 'ui-sans-serif' }}>
-      <h1>Faceless Auto-Editor (pipeline)</h1>
+      <h1>Faceless Auto-Editor (storyboarded)</h1>
 
       <form onSubmit={startJob} style={{ display: 'grid', gap: 12 }}>
         <label>Topic <input value={topic} onChange={e => setTopic(e.target.value)} required /></label>
         <label>Niche <input value={niche} onChange={e => setNiche(e.target.value)} required /></label>
         <label>Tone <input value={tone} onChange={e => setTone(e.target.value)} placeholder="Informative, playful, dramatic…" /></label>
         <label>Target Duration (sec) <input type="number" min={10} value={dur} onChange={e => setDur(Number(e.target.value))} /></label>
+
+        <label>
+          Asset mode
+          <select value={assetMode} onChange={e => setAssetMode(e.target.value as any)} style={{ marginLeft: 8 }}>
+            <option value="image_only">Images only (safest)</option>
+            <option value="image_first">Images first (fallback to video)</option>
+            <option value="video_first">Video first (fallback to image)</option>
+          </select>
+        </label>
 
         <label><input type="checkbox" checked={usePortrait} onChange={e => setUsePortrait(e.target.checked)} /> Generate TikTok (9:16)</label>
         <label><input type="checkbox" checked={useLandscape} onChange={e => setUseLandscape(e.target.checked)} /> Generate YouTube (16:9)</label>

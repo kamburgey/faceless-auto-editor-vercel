@@ -61,7 +61,6 @@ function baseScore(c: Cand, want: 'portrait'|'landscape'|'any', mode: AssetMode)
   // mode preference
   if (mode === 'video_first' && c.assetType === 'video') s += 3
   if (mode === 'image_first' && c.assetType === 'image') s += 3
-  // image_only handled by filtering, ai handled outside
 
   // basic quality
   if ((c.width||0) >= 720) s += 1
@@ -97,13 +96,12 @@ export async function POST(req: NextRequest) {
     // ---------- candidate search (variety-aware) ----------
     const q = (visualQuery || segment.text).replace(/\s+/g, ' ').trim().slice(0, 120)
 
-    // small randomization to avoid same first page results
     const randPage = 1 + Math.floor(Math.random() * 3)
     const perPage = 30
 
     let cand: Cand[] = []
 
-    async function searchVideos(query:string) {
+    async function searchVideos(query:string): Promise<Cand[]> {
       const r = await fetch(
         `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=${perPage}&page=${randPage}`,
         { headers, cache:'no-store' }
@@ -123,11 +121,11 @@ export async function POST(req: NextRequest) {
           frames: frames.length ? frames : cover,
           photographer: v.user?.name
         }
-      }).filter(x => !!x.src)
+      }).filter((x: Cand) => !!x.src)
       return items
     }
 
-    async function searchPhotos(query:string) {
+    async function searchPhotos(query:string): Promise<Cand[]> {
       const r = await fetch(
         `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${perPage}&page=${randPage}`,
         { headers, cache:'no-store' }
@@ -140,13 +138,12 @@ export async function POST(req: NextRequest) {
         assetType: 'image' as const,
         width: p.width, height: p.height,
         duration: segLen,
-        frames: [p.src?.medium || p.src?.large || p.src?.original].filter(Boolean),
+        frames: [p.src?.medium || p.src?.large || p.src?.original].filter(Boolean) as string[],
         photographer: p.photographer
-      })).filter(x => !!x.src)
+      })).filter((x: Cand) => !!x.src)
       return items
     }
 
-    // prefer based on mode / assetPreference
     const wantVideoFirst =
       assetMode === 'video_first' ||
       (assetMode === 'ai' && assetPreference === 'video')
@@ -158,15 +155,14 @@ export async function POST(req: NextRequest) {
     } else if (wantImageOnly) {
       cand = await searchPhotos(q)
     } else {
-      // image_first or ai with image preference
       cand = await searchPhotos(q)
       if (cand.length < MAX_CANDIDATES) cand = cand.concat(await searchVideos(q))
     }
 
     // de-dup & exclude used
-    cand = uniqueBy(cand, c => c.id)
-      .filter(c => !exclude.has(c.id))
-    cand = uniqueBy(cand, c => c.src)
+    cand = uniqueBy<Cand, string>(cand, (c: Cand) => c.id)
+      .filter((c: Cand) => !exclude.has(c.id))
+    cand = uniqueBy<Cand, string>(cand, (c: Cand) => c.src)
 
     if (!cand.length) return j({ error:'no_candidates' }, 200)
 
@@ -175,19 +171,16 @@ export async function POST(req: NextRequest) {
       ? (assetPreference === 'video' ? 'video_first' : 'image_first')
       : assetMode
 
-    // heuristic baseline
     const ranked = cand
-      .map((c, i) => {
+      .map((c: Cand, i: number) => {
         let s = baseScore(c, want, pickMode)
-        // small variety bonus for new photographers
         if (c.photographer) s += 0.5
         return { i, s }
       })
-      .sort((a,b)=>b.s-a.s)
+      .sort((a, b) => b.s - a.s)
 
     let choiceIdx = ranked[0].i
 
-    // Try SMART_PICK (vision) if enabled
     if (SMART_PICK && process.env.OPENAI_API_KEY) {
       const controller = new AbortController()
       const to = setTimeout(()=>controller.abort(), SMART_PICK_TIMEOUT_MS)
@@ -197,9 +190,9 @@ export async function POST(req: NextRequest) {
           type:'text',
           text:`Pick the best b-roll for:\n"${q}"\nAspect priority: ${want}. Prefer variety from previous picks (avoid duplicates).\nReturn {"best_index":<0-based>}.`
         }]
-        top.forEach((c,i)=>{
+        top.forEach((c: Cand, i: number)=>{
           content.push({ type:'text', text:`Candidate ${i} – ${c.assetType} ${c.width}x${c.height}` })
-          ;(c.frames||[]).slice(0,FRAMES_PER_CANDIDATE).forEach(u=>{
+          ;(c.frames||[]).slice(0,FRAMES_PER_CANDIDATE).forEach((u: string)=>{
             content.push({ type:'image_url', image_url:{ url:u } })
           })
         })
@@ -226,7 +219,6 @@ export async function POST(req: NextRequest) {
       } catch { /* fall back to heuristic */ }
     }
 
-    // final guard: if selection somehow in exclude list (racey), move to next
     if (exclude.has(cand[choiceIdx].id)) {
       const fallback = ranked.find(r => !exclude.has(cand[r.i].id))
       if (fallback) choiceIdx = fallback.i

@@ -1,8 +1,6 @@
 'use client'
 import { useEffect, useState } from 'react'
 
-const [usedIds, setUsedIds] = useState<string[]>([])
-
 type Jobs = { portrait?: string; landscape?: string }
 
 type Segment = {
@@ -16,7 +14,7 @@ type Clip = { src: string; start: number; length: number; assetType: 'video' | '
 type AssetMode = 'ai' | 'image_only' | 'image_first' | 'video_first'
 type VOStyle = 'natural_conversational' | 'narrator_warm' | 'energetic'
 
-const DEFAULT_UI_VOICE = 'wBXNqKUATyqu0RtYt25i' // literal default per your note
+const DEFAULT_UI_VOICE = 'wBXNqKUATyqu0RtYt25i' // your current default
 
 export default function Home() {
   // ---------- form ----------
@@ -44,6 +42,7 @@ export default function Home() {
   const [captionsUrl, setCaptionsUrl] = useState<string | null>(null)
   const [segments, setSegments] = useState<Segment[] | null>(null)
   const [clips, setClips] = useState<Clip[] | null>(null)
+  const [usedIds, setUsedIds] = useState<string[]>([]) // <— moved INSIDE component
 
   // ---------- render/poll ----------
   const [jobs, setJobs] = useState<Jobs>({})
@@ -143,7 +142,7 @@ export default function Home() {
             visualQuery: beats[i].visualQuery,
             assetPreference: beats[i].assetPreference,
             outputs: { portrait: usePortrait, landscape: useLandscape },
-            excludeIds: usedIds,
+            excludeIds: usedIds
           }
           if (assetMode !== 'ai') payload.assetMode = assetMode // only override if user chose a mode
 
@@ -155,7 +154,7 @@ export default function Home() {
           if (!r.ok) throw new Error(await r.text())
           const jr = await safeJson(r)
           if (jr?.clip) chosen.push(jr.clip)
-          if (jr.pickedId) setUsedIds(prev => [...prev, String(jr.pickedId)]) // <— NEW
+          if (jr?.pickedId) setUsedIds(prev => [...prev, String(jr.pickedId)]) // prevent repeats
         } catch (err: any) {
           pushProgress(`• Segment ${i + 1} error: ${err?.message?.slice(0,120) || String(err)}`)
         }
@@ -232,38 +231,43 @@ export default function Home() {
 
         <fieldset style={{ border:'1px solid #333', borderRadius:8, padding:10 }}>
           <legend>Voiceover</legend>
-          <label>
-            ElevenLabs Voice ID
-            <input
-              value={voiceId}
-              onChange={e => setVoiceId(e.target.value)}
-              placeholder="wBXNqKUATyqu0RtYt25i"
-              style={{ marginLeft: 8, width: 290 }}
-            />
-          </label>
-          <label style={{ marginLeft: 12 }}>
-            Style{' '}
-            <select value={voStyle} onChange={e => setVoStyle(e.target.value as VOStyle)} style={{ marginLeft: 6 }}>
-              <option value="natural_conversational">Natural · conversational</option>
-              <option value="narrator_warm">Narrator · warm</option>
-              <option value="energetic">Energetic · punchy</option>
-            </select>
-          </label>
-          <label style={{ marginLeft: 12 }}>
-            Pace: <code>{voPace.toFixed(2)}×</code>
-            <input
-              type="range"
-              min={0.85}
-              max={1.15}
-              step={0.01}
-              value={voPace}
-              onChange={e => setVoPace(Number(e.target.value))}
-              style={{ marginLeft: 6, verticalAlign: 'middle' }}
-            />
-          </label>
-          <label style={{ marginLeft: 12 }}>
-            <input type="checkbox" checked={voBreaths} onChange={e => setVoBreaths(e.target.checked)} /> Natural pauses/breaths
-          </label>
+          <div style={{ display:'flex', gap:12, flexWrap:'wrap', alignItems:'center' }}>
+            <label>
+              ElevenLabs Voice ID
+              <input
+                value={voiceId}
+                onChange={e => setVoiceId(e.target.value)}
+                placeholder="wBXNqKUATyqu0RtYt25i"
+                style={{ marginLeft: 8, width: 290 }}
+              />
+            </label>
+
+            <label>
+              Style
+              <select value={voStyle} onChange={e => setVoStyle(e.target.value as VOStyle)} style={{ marginLeft: 6 }}>
+                <option value="natural_conversational">Natural · conversational</option>
+                <option value="narrator_warm">Narrator · warm</option>
+                <option value="energetic">Energetic · punchy</option>
+              </select>
+            </label>
+
+            <label>
+              Pace: <code>{voPace.toFixed(2)}×</code>
+              <input
+                type="range"
+                min={0.85}
+                max={1.15}
+                step={0.01}
+                value={voPace}
+                onChange={e => setVoPace(Number(e.target.value))}
+                style={{ marginLeft: 6, verticalAlign: 'middle' }}
+              />
+            </label>
+
+            <label>
+              <input type="checkbox" checked={voBreaths} onChange={e => setVoBreaths(e.target.checked)} /> Natural pauses/breaths
+            </label>
+          </div>
         </fieldset>
 
         <label>
@@ -308,15 +312,13 @@ export default function Home() {
           </summary>
           <ol style={{ marginTop: 8, lineHeight: 1.4 }}>
             {segments.map((b, i) => {
-              const chosen = clips?.[i]; // best-effort alignment
+              const chosen = clips?.[i] // best-effort alignment
               return (
                 <li key={i}>
                   <code>[{fmt(b.start)}–{fmt(b.end)}s]</code>{' '}
                   <b>{(b.assetPreference || 'auto').toUpperCase()}</b>{' '}
                   — <i>{b.visualQuery || '(no query)'}</i>
-                  {chosen && (
-                    <> · chosen: <b>{chosen.assetType}</b> · {fmt(chosen.length)}s</>
-                  )}
+                  {chosen && (<> · chosen: <b>{chosen.assetType}</b> · {fmt(chosen.length)}s</>)}
                 </li>
               )
             })}
